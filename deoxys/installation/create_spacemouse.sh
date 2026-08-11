@@ -1,7 +1,8 @@
-sudo touch /etc/udev/rules.d/77-spacemouse.rules
-
-echo "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"256f\", ATTRS{idProduct}==\"c62e\", MODE=\"0666\", GROUP=\"plugdev\"" > /etc/udev/rules.d/77-spacemouse.rules
-
-echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"256f\", ATTRS{idProduct}==\"c62e\", MODE=\"0666\", GROUP=\"plugdev\"" >> /etc/udev/rules.d/77-spacemouse.rules
+sudo tee /etc/udev/rules.d/77-spacemouse.rules >/dev/null <<'EOF'
+KERNEL=="hidraw*", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c62e", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c62e", MODE="0666", GROUP="plugdev"
+KERNEL=="hidraw*", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c63a", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c63a", MODE="0666", GROUP="plugdev"
+EOF
 
 sudo udevadm control --reload-rules

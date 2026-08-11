@@ -17,3 +17,37 @@ deoxys/logs
 __pycache__
 data_collection_example
 *_pb2.py
+
+# Local editor and generated runtime files
+.vscode/
+*.log
+*.bag
+*.mp4
+*.avi
+*.pkl
+*.pkl.tmp
+*.bak_*
+
+# Robot data, calibration output, and experiment artifacts
+deoxys/data/
+deoxys/calib_data/
+deoxys/npz__trans_output/
+deoxys/replay_results/
+deoxys/examples/logs/
+deoxys/3d_*.png
+deoxys/hand_joints_21_latest.csv
+deoxys/wrist_traj_right_scaled.csv
+deoxys/examples.zip
+
+# Large project-specific code/checkpoints maintained outside core deoxys
+deoxys/vqvla_scripts/
+
+# Local links, command notes, and one-off scratch scripts
+deoxys/zzdata1897
+deoxys/command.txt
+deoxys/aaaa.py
+deoxys/bbbb.py
+deoxys/syncRecord.txt
+deoxys/zzread.py
+deoxys/zzutils.py
+deoxys/~/

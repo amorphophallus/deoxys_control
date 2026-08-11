@@ -116,6 +116,7 @@ class SpaceMouse:
         print("Opening SpaceMouse device")
         self.device = hid.device()
         self.device.open(vendor_id, product_id)  # SpaceMouse
+        self.product_id = product_id
 
         self.pos_sensitivity = pos_sensitivity
         self.rot_sensitivity = rot_sensitivity
@@ -163,9 +164,9 @@ class SpaceMouse:
         print_command("ESC", "quit")
         print("")
 
-    def _reset_internal_state(self):
+    def _reset_motion_state(self):
         """
-        Resets internal state of controller, except for the reset signal.
+        Resets 6-DoF motion state without changing the gripper hold state.
         """
         self.rotation = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]])
         # Reset 6-DOF variables
@@ -173,15 +174,24 @@ class SpaceMouse:
         self.roll, self.pitch, self.yaw = 0, 0, 0
         # Reset control
         self._control = np.zeros(6)
+
+    def _reset_internal_state(self):
+        """
+        Resets internal state of controller, except for the reset signal.
+        """
+        self._reset_motion_state()
         # Reset grasp
         self.single_click_and_hold = False
 
-    def start_control(self):
+    def start_control(self, preserve_gripper=False):
         """
         Method that should be called externally before controller can
         start receiving commands.
         """
+        gripper_held = self.single_click_and_hold if preserve_gripper else False
         self._reset_internal_state()
+        if preserve_gripper:
+            self.single_click_and_hold = gripper_held
         self._reset_state = 0
         self._enabled = True
 
@@ -219,42 +229,69 @@ class SpaceMouse:
             d = self.device.read(13)
             if d is not None and self._enabled:
 
-                if d[0] == 1:  ## readings from 6-DoF sensor
-                    self.y = convert(d[1], d[2])
-                    self.x = convert(d[3], d[4])
-                    self.z = convert(d[5], d[6]) * -1.0
+                if self.product_id == 50741:
+                    # Older models send translation and rotation in separate reports.
+                    if d[0] == 1:  ## readings from 6-DoF sensor
+                        self.y = convert(d[1], d[2])
+                        self.x = convert(d[3], d[4])
+                        self.z = convert(d[5], d[6]) * -1.0
 
-                    self.roll = convert(d[7], d[8])
-                    self.pitch = convert(d[9], d[10])
-                    self.yaw = convert(d[11], d[12])
+                    elif d[0] == 2:
+                        self.roll = convert(d[1], d[2])
+                        self.pitch = convert(d[3], d[4])
+                        self.yaw = convert(d[5], d[6])
 
-                    self._control = [
-                        self.x,
-                        self.y,
-                        self.z,
-                        self.roll,
-                        self.pitch,
-                        self.yaw,
-                    ]
+                        self._control = [
+                            self.x,
+                            self.y,
+                            self.z,
+                            self.roll,
+                            self.pitch,
+                            self.yaw,
+                        ]
+                else:
+                    # Newer models, including SpaceMouse Wireless BT, send all 6 axes
+                    # in a single 13-byte report.
+                    if d[0] == 1:  ## readings from 6-DoF sensor
+                        self.y = convert(d[1], d[2])
+                        self.x = convert(d[3], d[4])
+                        self.z = convert(d[5], d[6]) * -1.0
 
-                elif d[0] == 3:  ## readings from the side buttons
+                        self.roll = convert(d[7], d[8])
+                        self.pitch = convert(d[9], d[10])
+                        self.yaw = convert(d[11], d[12])
+
+                        self._control = [
+                            self.x,
+                            self.y,
+                            self.z,
+                            self.roll,
+                            self.pitch,
+                            self.yaw,
+                        ]
+
+                if d[0] == 3:  ## readings from the side buttons
+                    button_state = d[1]
+                    left_pressed = bool(button_state & 1)
+                    right_pressed = bool(button_state & 2)
 
                     # press left button
-                    if d[1] == 1:
+                    if left_pressed and not self.single_click_and_hold:
                         t_click = time.time()
                         elapsed_time = t_click - t_last_click
                         t_last_click = t_click
                         self.single_click_and_hold = True
 
                     # release left button
-                    if d[1] == 0:
+                    if not left_pressed:
                         self.single_click_and_hold = False
 
                     # right button is for reset
-                    if d[1] == 2:
+                    if right_pressed:
                         self._reset_state = 1
                         self._enabled = False
-                        self._reset_internal_state()
+                        self._reset_motion_state()
+                        self.single_click_and_hold = left_pressed
 
     @property
     def control(self):
