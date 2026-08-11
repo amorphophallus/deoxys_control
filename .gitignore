@@ -51,3 +51,7 @@ deoxys/syncRecord.txt
 deoxys/zzread.py
 deoxys/zzutils.py
 deoxys/~/
+
+# Superseded or non-portable local replay scripts
+deoxys/examples/run_deoxys_with_space_mouse_V2.py
+deoxys/joint_position_control_replay.py
