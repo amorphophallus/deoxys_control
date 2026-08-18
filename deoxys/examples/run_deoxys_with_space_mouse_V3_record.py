@@ -1,38 +1,36 @@
-"""SpaceMouse teleoperation with on-demand dual RealSense demonstration recording."""
+"""SpaceMouse teleoperation with FurnitureBench-compatible raw data capture."""
 
 import argparse
+import concurrent.futures
 import os
 import pickle
 import select
 import sys
 import termios
-import threading
 import time
 import tty
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from deoxys.franka_interface import FrankaInterface
 from deoxys.utils import transform_utils
 from deoxys.utils.config_utils import get_default_controller_config
+from deoxys.utils.furniture_bench_utils import (
+    DEFAULT_FRONT_SERIAL,
+    DEFAULT_WRIST_SERIAL,
+    DualRealSenseSnapshotter,
+    deoxys_delta_to_furniture_bench_action,
+    wrist_pose_to_tip_pose,
+)
 from deoxys.utils.input_utils import input2action
 from deoxys.utils.io_devices import SpaceMouse
 from deoxys.utils.log_utils import get_deoxys_example_logger
 
+
 logger = get_deoxys_example_logger()
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
-
-try:
-    import pyrealsense2 as rs
-except ImportError:
-    rs = None
-
 
 RESET_JOINT_POSITIONS = [
     0.09162008114028396,
@@ -44,9 +42,6 @@ RESET_JOINT_POSITIONS = [
     0.8480939705504309,
 ]
 
-DEFAULT_FRONT_SERIAL = "327122071654"
-DEFAULT_WRIST_SERIAL = "001622071252"
-
 
 class NonBlockingKeyReader:
     def __init__(self):
@@ -56,7 +51,7 @@ class NonBlockingKeyReader:
 
     def __enter__(self):
         if not sys.stdin.isatty():
-            logger.warning("stdin is not a TTY; keyboard controls are disabled.")
+            logger.warning("stdin is not a TTY; keyboard controls are disabled")
             return self
         self._fd = sys.stdin.fileno()
         self._old_settings = termios.tcgetattr(self._fd)
@@ -81,201 +76,20 @@ class NonBlockingKeyReader:
         return keys
 
 
-def _try_get_frames(pipeline, aligner):
-    try:
-        success, frames = pipeline.try_wait_for_frames(timeout_ms=1000)
-    except RuntimeError:
-        return None
-    if not success:
-        return None
-    return aligner.process(frames) if aligner is not None else frames
-
-
-class DualRealSenseSnapshotter:
-    """Capture synchronized-enough front/wrist RGB-D pairs on a background thread."""
-
-    def __init__(
-        self,
-        front_serial,
-        wrist_serial,
-        width=640,
-        height=480,
-        fps=30,
-        record_width=224,
-        record_height=224,
-        save_depth=False,
-    ):
-        if rs is None or cv2 is None:
-            raise RuntimeError("pyrealsense2 and opencv-python are required for cameras")
-        if front_serial == wrist_serial:
-            raise ValueError("front and wrist camera serials must differ")
-
-        self.front_serial = str(front_serial)
-        self.wrist_serial = str(wrist_serial)
-        self.width = int(width)
-        self.height = int(height)
-        self.fps = int(fps)
-        self.record_size = (int(record_width), int(record_height))
-        self.save_depth = bool(save_depth)
-
-        self.front_pipeline = rs.pipeline()
-        self.wrist_pipeline = rs.pipeline()
-        self.front_aligner = rs.align(rs.stream.color)
-        self.wrist_aligner = rs.align(rs.stream.color)
-        self.front_depth_scale_m = None
-        self.wrist_depth_scale_m = None
-
-        self._stop_event = threading.Event()
-        self._lock = threading.Lock()
-        self._thread = None
-        self._thread_error = None
-        self._latest = None
-
-    def _config(self, serial):
-        config = rs.config()
-        config.enable_device(serial)
-        config.enable_stream(
-            rs.stream.depth,
-            self.width,
-            self.height,
-            rs.format.z16,
-            self.fps,
-        )
-        config.enable_stream(
-            rs.stream.color,
-            self.width,
-            self.height,
-            rs.format.bgr8,
-            self.fps,
-        )
-        return config
-
-    @staticmethod
-    def _depth_scale(profile):
-        return float(profile.get_device().first_depth_sensor().get_depth_scale())
-
-    def start(self):
-        front_profile = self.front_pipeline.start(self._config(self.front_serial))
-        try:
-            wrist_profile = self.wrist_pipeline.start(self._config(self.wrist_serial))
-        except Exception:
-            self.front_pipeline.stop()
-            raise
-        self.front_depth_scale_m = self._depth_scale(front_profile)
-        self.wrist_depth_scale_m = self._depth_scale(wrist_profile)
-        self._thread = threading.Thread(
-            target=self._capture_loop,
-            name="dual_realsense_snapshotter",
-            daemon=True,
-        )
-        self._thread.start()
-        logger.info(
-            "Dual RealSense started: front=%s wrist=%s",
-            self.front_serial,
-            self.wrist_serial,
-        )
-
-    def _prepare_rgb(self, frame):
-        bgr = np.asanyarray(frame.get_data())
-        bgr = cv2.resize(bgr, self.record_size, interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    def _prepare_depth(self, frame):
-        depth = np.asanyarray(frame.get_data())
-        return cv2.resize(depth, self.record_size, interpolation=cv2.INTER_NEAREST)
-
-    def _capture_loop(self):
-        try:
-            while not self._stop_event.is_set():
-                front_frames = _try_get_frames(
-                    self.front_pipeline,
-                    self.front_aligner,
-                )
-                wrist_frames = _try_get_frames(
-                    self.wrist_pipeline,
-                    self.wrist_aligner,
-                )
-                if front_frames is None or wrist_frames is None:
-                    continue
-
-                front_color = front_frames.get_color_frame()
-                wrist_color = wrist_frames.get_color_frame()
-                front_depth = front_frames.get_depth_frame()
-                wrist_depth = wrist_frames.get_depth_frame()
-                if not front_color or not wrist_color:
-                    continue
-                if self.save_depth and (not front_depth or not wrist_depth):
-                    continue
-
-                sample = {
-                    "color_image1": self._prepare_rgb(wrist_color),
-                    "color_image2": self._prepare_rgb(front_color),
-                    "camera_capture_wall_time_ns": time.time_ns(),
-                    "front_sensor_timestamp_ms": float(front_color.get_timestamp()),
-                    "wrist_sensor_timestamp_ms": float(wrist_color.get_timestamp()),
-                    "front_frame_number": int(front_color.get_frame_number()),
-                    "wrist_frame_number": int(wrist_color.get_frame_number()),
-                }
-                if self.save_depth:
-                    sample.update(
-                        {
-                            "depth_image1": self._prepare_depth(wrist_depth),
-                            "depth_image2": self._prepare_depth(front_depth),
-                        }
-                    )
-                with self._lock:
-                    self._latest = sample
-        except Exception as exc:
-            self._thread_error = exc
-            self._stop_event.set()
-            logger.exception("Dual RealSense capture failed")
-
-    def latest(self):
-        if self._thread_error is not None:
-            raise RuntimeError("dual RealSense capture failed") from self._thread_error
-        with self._lock:
-            return None if self._latest is None else dict(self._latest)
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-        for pipeline in (self.front_pipeline, self.wrist_pipeline):
-            try:
-                pipeline.stop()
-            except Exception:
-                pass
-
-    def metadata(self):
-        return {
-            "front_camera_serial": self.front_serial,
-            "wrist_camera_serial": self.wrist_serial,
-            "camera_stream_width": self.width,
-            "camera_stream_height": self.height,
-            "camera_fps": self.fps,
-            "record_image_width": self.record_size[0],
-            "record_image_height": self.record_size[1],
-            "depth_enabled": self.save_depth,
-            "depth_encoding": "uint16_z16",
-            "front_depth_scale_m": self.front_depth_scale_m,
-            "wrist_depth_scale_m": self.wrist_depth_scale_m,
-        }
-
-
-def _array_field(message, *names, size=None):
+def _array_field(message, *names, size):
     for name in names:
         if hasattr(message, name):
             value = np.asarray(getattr(message, name), dtype=np.float64).reshape(-1)
-            if size is None or value.size == size:
+            if value.size == size:
                 return value
-    return np.full(0 if size is None else size, np.nan, dtype=np.float64)
+    return np.full(size, np.nan, dtype=np.float64)
 
 
 def _gripper_width(robot_interface):
     value = robot_interface.last_gripper_q
     if value is None:
-        return np.array([np.nan], dtype=np.float64)
-    return np.asarray(value, dtype=np.float64).reshape(-1)[:1]
+        return float("nan")
+    return float(np.asarray(value).reshape(-1)[0])
 
 
 def build_observation(robot_interface, camera_sample):
@@ -284,25 +98,31 @@ def build_observation(robot_interface, camera_sample):
 
     state = robot_interface._state_buffer[-1]
     raw_pose = np.asarray(state.O_T_EE, dtype=np.float64)
-    if raw_pose.size == 16:
-        ee_pose = raw_pose.reshape(4, 4).transpose()
-        ee_pos = ee_pose[:3, 3].copy()
-        ee_quat = transform_utils.mat2quat(ee_pose[:3, :3])
-    else:
-        ee_pose = np.full((4, 4), np.nan, dtype=np.float64)
-        ee_pos = np.full(3, np.nan, dtype=np.float64)
-        ee_quat = np.full(4, np.nan, dtype=np.float64)
-
+    if raw_pose.size != 16:
+        return None
+    wrist_pose = raw_pose.reshape(4, 4).transpose()
+    tip_pose = wrist_pose_to_tip_pose(wrist_pose)
+    tip_quaternion = transform_utils.mat2quat(tip_pose[:3, :3])
     ee_velocity = _array_field(state, "O_dP_EE_c", "O_dP_EE", size=6)
-    observation = dict(camera_sample)
+    tip_offset_in_base = tip_pose[:3, 3] - wrist_pose[:3, 3]
+    tip_linear_velocity = ee_velocity[:3] + np.cross(
+        ee_velocity[3:],
+        tip_offset_in_base,
+    )
+
+    observation = {
+        key: value.copy() if isinstance(value, np.ndarray) else value
+        for key, value in camera_sample.items()
+    }
     observation.update(
         {
             "control_wall_time_ns": time.time_ns(),
             "robot_state": {
-                "ee_pos": ee_pos,
-                "ee_quat": ee_quat,
-                "ee_pose": ee_pose,
-                "ee_pos_vel": ee_velocity[:3],
+                "ee_pos": tip_pose[:3, 3].copy(),
+                "ee_quat": tip_quaternion.copy(),
+                "ee_pose": tip_pose.copy(),
+                "wrist_pose": wrist_pose.copy(),
+                "ee_pos_vel": tip_linear_velocity,
                 "ee_ori_vel": ee_velocity[3:],
                 "joint_positions": _array_field(state, "q", size=7),
                 "joint_velocities": _array_field(state, "dq", size=7),
@@ -314,119 +134,262 @@ def build_observation(robot_interface, camera_sample):
                 ),
                 "gripper_width": _gripper_width(robot_interface),
             },
+            "ee_pos_sim": None,
+            "ee_quat_sim": None,
+            "point_cloud": None,
+            "skill": None,
+            "guidance": None,
         }
     )
     return observation
 
 
-class RawEpisodeRecorder:
-    def __init__(self, output_root, task_name, randomness, camera_metadata):
-        self.output_dir = (
-            Path(output_root).expanduser().resolve() / randomness / task_name
+def _write_video_atomic(output_path, observations, fps):
+    frames = []
+    for observation in observations:
+        if "color_image1" not in observation or "color_image2" not in observation:
+            continue
+        wrist = cv2.cvtColor(observation["color_image1"], cv2.COLOR_RGB2BGR)
+        front = cv2.cvtColor(observation["color_image2"], cv2.COLOR_RGB2BGR)
+        frames.append(cv2.hconcat([wrist, front]))
+    if not frames:
+        return
+
+    temporary_path = output_path.with_name(output_path.stem + ".tmp.mp4")
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        str(temporary_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"failed to open video writer for {temporary_path}")
+    try:
+        for frame in frames:
+            writer.write(frame)
+    finally:
+        writer.release()
+    os.replace(temporary_path, output_path)
+
+
+def _write_episode(output_path, payload, video_fps, save_video):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(".pkl.tmp")
+    with temporary_path.open("wb") as output_file:
+        pickle.dump(payload, output_file, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary_path, output_path)
+    if save_video:
+        _write_video_atomic(
+            output_path.with_suffix(".mp4"),
+            payload["observations"],
+            video_fps,
         )
+    return output_path
+
+
+class EpisodeWriter:
+    def __init__(self, video_fps=10, save_video=True):
+        self.video_fps = int(video_fps)
+        self.save_video = bool(save_video)
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="episode_writer",
+        )
+        self.futures = []
+
+    def submit(self, output_path, payload):
+        future = self.executor.submit(
+            _write_episode,
+            output_path,
+            payload,
+            self.video_fps,
+            self.save_video,
+        )
+        self.futures.append(future)
+        future.add_done_callback(self._report_result)
+
+    @staticmethod
+    def _report_result(future):
+        try:
+            logger.info("Saved raw episode to %s", future.result())
+        except Exception:
+            logger.exception("Episode writer failed")
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+        for future in self.futures:
+            future.result()
+
+
+class RawEpisodeRecorder:
+    def __init__(
+        self,
+        data_root,
+        task_name,
+        randomness,
+        camera_info,
+        writer,
+    ):
+        self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
         self.randomness = randomness
-        self.camera_metadata = camera_metadata
+        self.camera_info = camera_info
+        self.writer = writer
         self.observations = []
         self.actions = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
+        self.last_recorded_gripper = None
+        self.gripper_hold_remaining = 0
 
-    def begin(self):
+    @staticmethod
+    def _parts_ready(observation):
+        if observation is None:
+            return False
+        valid = observation.get("parts_pose_valid")
+        return valid is not None and bool(valid[0] and valid[4])
+
+    def begin(self, initial_observation):
         if self.state == "recording":
-            logger.warning("An episode is already recording.")
-            return
+            logger.warning("An episode is already recording")
+            return False
         if self.state == "pending_save":
-            logger.warning("Save or discard the previous episode first.")
-            return
-        self.observations = []
+            logger.warning("Save or discard the previous episode first")
+            return False
+        if not self._parts_ready(initial_observation):
+            logger.warning(
+                "Recording not started: tabletop and movable-leg poses have not "
+                "both been detected"
+            )
+            return False
+        self.observations = [initial_observation]
         self.actions = []
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
+        self.last_recorded_gripper = None
+        self.gripper_hold_remaining = 0
         self.state = "recording"
-        logger.info("Recording started.")
+        logger.info("Recording started")
+        return True
+
+    def should_record(self, action, no_op_threshold, gripper_hold_frames):
+        gripper = float(np.sign(action[-1]))
+        gripper_changed = (
+            self.last_recorded_gripper is None
+            or gripper != self.last_recorded_gripper
+        )
+        if gripper_changed:
+            self.gripper_hold_remaining = int(gripper_hold_frames)
+        motion = float(np.linalg.norm(action[:6])) > no_op_threshold
+        return motion or gripper_changed or self.gripper_hold_remaining > 0
 
     def append(self, observation, action):
         if self.state != "recording" or observation is None:
             return
-        self.observations.append(observation)
+        if len(self.observations) == len(self.actions):
+            self.observations.append(observation)
+        if len(self.observations) != len(self.actions) + 1:
+            raise RuntimeError("invalid observation/action alignment")
         self.actions.append(np.asarray(action, dtype=np.float32).copy())
+        gripper = float(np.sign(action[-1]))
+        if self.last_recorded_gripper == gripper and self.gripper_hold_remaining > 0:
+            self.gripper_hold_remaining -= 1
+        self.last_recorded_gripper = gripper
 
-    def stop(self):
+    def stop(self, final_observation):
         if self.state != "recording":
-            logger.warning("No episode is recording.")
+            logger.warning("No episode is recording")
             return
+        if self.actions and len(self.observations) == len(self.actions):
+            if final_observation is None:
+                logger.warning("Waiting for a terminal observation before stopping")
+                return
+            self.observations.append(final_observation)
         self.stopped_at = datetime.now().isoformat(timespec="milliseconds")
         self.state = "pending_save"
         logger.info(
-            "Recording stopped with %d samples. Press 's' to save or 'd' to discard.",
+            "Recording stopped with %d actions. Press s=success, f=failure, d=discard",
             len(self.actions),
         )
 
-    def _next_path(self):
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        used = []
-        for path in self.output_dir.glob("*.pkl"):
-            if path.stem.isdigit():
-                used.append(int(path.stem))
-        return self.output_dir / f"{max(used, default=-1) + 1:05d}.pkl"
+    def _output_path(self, outcome):
+        output_dir = (
+            self.data_root
+            / "raw"
+            / "osc"
+            / "real"
+            / self.task_name
+            / "teleop"
+            / self.randomness
+            / outcome
+        )
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")
+        return output_dir / f"{timestamp}.pkl"
 
-    def save(self):
+    def save(self, success):
         if self.state != "pending_save":
-            logger.warning("There is no stopped episode waiting to be saved.")
+            logger.warning("There is no stopped episode waiting to be saved")
             return None
         if not self.actions:
-            logger.warning("The episode contains no valid samples; discarding it.")
+            logger.warning("The episode contains no action; discarding it")
             self.discard()
             return None
+        if len(self.observations) != len(self.actions) + 1:
+            raise RuntimeError(
+                "raw episode must contain N+1 observations and N actions"
+            )
 
-        output_path = self._next_path()
+        outcome = "success" if success else "failure"
+        output_path = self._output_path(outcome)
         payload = {
-            "furniture": self.task_name,
             "observations": self.observations,
             "actions": self.actions,
-            "rewards": [0] * len(self.actions),
-            "skills": [0] * len(self.actions),
+            "rewards": [0.0] * len(self.actions),
+            "camera_info": self.camera_info,
+            "success": bool(success),
+            "task": self.task_name,
+            "furniture": self.task_name,
+            "action_type": "delta",
             "metadata": {
-                "schema": "deoxys_furniturebench_raw_v1",
+                "schema": "deoxys_furniturebench_raw_v2",
                 "controller_observation_alignment": "observation_before_action",
+                "parts_poses_frame": "furniture_bench_april_tag",
+                "action_translation_unit": "meter",
+                "action_quaternion_order": "xyzw",
+                "action_rotation_semantics": "right_multiply_local_tip_delta",
                 "randomness": self.randomness,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
-                "num_samples": len(self.actions),
-                "camera_key_mapping": {
-                    "color_image1": "wrist",
-                    "color_image2": "front",
-                    "depth_image1": "wrist",
-                    "depth_image2": "front",
-                },
-                **self.camera_metadata,
+                "num_observations": len(self.observations),
+                "num_actions": len(self.actions),
             },
         }
-        temporary_path = output_path.with_suffix(".pkl.tmp")
-        with temporary_path.open("wb") as output_file:
-            pickle.dump(payload, output_file, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temporary_path, output_path)
-        logger.info("Saved raw episode to %s", output_path)
+        self.writer.submit(output_path, payload)
         self.discard(log=False)
         return output_path
 
     def discard(self, log=True):
-        sample_count = len(self.actions)
+        action_count = len(self.actions)
         self.observations = []
         self.actions = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
+        self.last_recorded_gripper = None
+        self.gripper_hold_remaining = 0
         if log:
-            logger.info("Discarded episode with %d samples.", sample_count)
+            logger.info("Discarded episode with %d actions", action_count)
 
 
 def wait_for_robot_state(robot_interface, timeout=5.0):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        if robot_interface.received_states and robot_interface.check_nonzero_configuration():
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (
+            robot_interface.received_states
+            and robot_interface.check_nonzero_configuration()
+        ):
             return True
         time.sleep(0.05)
     return False
@@ -440,14 +403,13 @@ def move_to_reset_joint_positions(
     gripper_open,
 ):
     if not wait_for_robot_state(robot_interface):
-        logger.warning("Robot state not received before reset request.")
+        logger.warning("Robot state not received before reset request")
         return False
-
     target = np.asarray(RESET_JOINT_POSITIONS, dtype=np.float64)
     action = target.tolist() + [-1.0 if gripper_open else 1.0]
-    start_time = time.time()
+    deadline = time.monotonic() + timeout
     max_error = float("inf")
-    while time.time() - start_time < timeout:
+    while time.monotonic() < deadline:
         current_q = robot_interface.last_q
         if current_q is not None:
             max_error = float(np.max(np.abs(np.asarray(current_q) - target)))
@@ -463,60 +425,100 @@ def move_to_reset_joint_positions(
     return False
 
 
+def scaled_deoxys_action(action, controller_cfg):
+    scaled = np.asarray(action, dtype=np.float64).copy()
+    scaled[:3] *= controller_cfg.action_scale.translation
+    scaled[3:6] *= controller_cfg.action_scale.rotation
+    return scaled
+
+
 def parse_args():
+    default_data_root = os.environ.get("DATA_DIR_RAW")
     parser = argparse.ArgumentParser()
     parser.add_argument("--interface-cfg", default="config/charmander.yml")
     parser.add_argument("--controller-type", default="OSC_POSE")
     parser.add_argument("--vendor-id", type=int, default=9583)
     parser.add_argument("--product-id", type=int, default=50746)
-    parser.add_argument("--output-root", default="data/raw_spacemouse")
-    parser.add_argument("--task-name", default="unnamed_task")
-    parser.add_argument("--randomness", default="low")
-    parser.add_argument("--front-camera-serial", default=DEFAULT_FRONT_SERIAL)
-    parser.add_argument("--wrist-camera-serial", default=DEFAULT_WRIST_SERIAL)
-    parser.add_argument("--camera-width", type=int, default=640)
-    parser.add_argument("--camera-height", type=int, default=480)
-    parser.add_argument("--camera-fps", type=int, default=30)
-    parser.add_argument("--record-image-width", type=int, default=224)
-    parser.add_argument("--record-image-height", type=int, default=224)
-    parser.add_argument("--save-depth", action="store_true")
-    parser.add_argument("--no-cameras", action="store_true")
+    parser.add_argument("--data-root", default=default_data_root)
+    parser.add_argument("--task-name", choices=("one_leg",), default="one_leg")
+    parser.add_argument("--randomness", choices=("low",), default="low")
+    parser.add_argument(
+        "--front-camera-serial",
+        "--camera-high-serial",
+        dest="front_camera_serial",
+        default=DEFAULT_FRONT_SERIAL,
+    )
+    parser.add_argument(
+        "--wrist-camera-serial",
+        dest="wrist_camera_serial",
+        default=DEFAULT_WRIST_SERIAL,
+    )
+    parser.add_argument("--front-color-width", type=int, default=1280)
+    parser.add_argument("--front-color-height", type=int, default=720)
+    parser.add_argument("--front-color-fps", type=int, default=30)
+    parser.add_argument("--front-depth-width", type=int, default=1280)
+    parser.add_argument("--front-depth-height", type=int, default=720)
+    parser.add_argument("--front-depth-fps", type=int, default=30)
+    parser.add_argument("--wrist-color-width", type=int, default=640)
+    parser.add_argument("--wrist-color-height", type=int, default=480)
+    parser.add_argument("--wrist-color-fps", type=int, default=30)
+    parser.add_argument("--wrist-depth-width", type=int, default=640)
+    parser.add_argument("--wrist-depth-height", type=int, default=480)
+    parser.add_argument("--wrist-depth-fps", type=int, default=30)
+    parser.add_argument("--record-image-width", type=int, default=320)
+    parser.add_argument("--record-image-height", type=int, default=240)
+    parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument("--no-op-threshold", type=float, default=1e-5)
+    parser.add_argument("--gripper-hold-frames", type=int, default=8)
+    parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--reset-timeout", type=float, default=7.0)
     parser.add_argument("--reset-tolerance", type=float, default=1e-3)
     parser.add_argument("--keep-gripper-closed-during-reset", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.data_root:
+        parser.error("--data-root is required when DATA_DIR_RAW is not set")
+    if args.record_fps <= 0:
+        parser.error("--record-fps must be greater than zero")
+    return args
 
 
 def main():
     args = parse_args()
     camera = None
     episode = None
+    writer = EpisodeWriter(
+        video_fps=args.record_fps,
+        save_video=not args.no_video,
+    )
     robot_interface = None
     controller_cfg = None
     try:
-        if not args.no_cameras:
-            camera = DualRealSenseSnapshotter(
-                front_serial=args.front_camera_serial,
-                wrist_serial=args.wrist_camera_serial,
-                width=args.camera_width,
-                height=args.camera_height,
-                fps=args.camera_fps,
-                record_width=args.record_image_width,
-                record_height=args.record_image_height,
-                save_depth=args.save_depth,
-            )
-            camera.start()
-
-        camera_metadata = (
-            {"cameras_enabled": False}
-            if camera is None
-            else {"cameras_enabled": True, **camera.metadata()}
+        camera = DualRealSenseSnapshotter(
+            front_serial=args.front_camera_serial,
+            wrist_serial=args.wrist_camera_serial,
+            record_width=args.record_image_width,
+            record_height=args.record_image_height,
+            track_one_leg=True,
+            front_width=args.front_color_width,
+            front_height=args.front_color_height,
+            front_fps=args.front_color_fps,
+            front_depth_width=args.front_depth_width,
+            front_depth_height=args.front_depth_height,
+            front_depth_fps=args.front_depth_fps,
+            wrist_width=args.wrist_color_width,
+            wrist_height=args.wrist_color_height,
+            wrist_fps=args.wrist_color_fps,
+            wrist_depth_width=args.wrist_depth_width,
+            wrist_depth_height=args.wrist_depth_height,
+            wrist_depth_fps=args.wrist_depth_fps,
         )
+        camera.start()
         episode = RawEpisodeRecorder(
-            output_root=args.output_root,
+            data_root=args.data_root,
             task_name=args.task_name,
             randomness=args.randomness,
-            camera_metadata=camera_metadata,
+            camera_info=camera.metadata(),
+            writer=writer,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
@@ -525,39 +527,49 @@ def main():
         controller_cfg = get_default_controller_config(args.controller_type)
         joint_controller_cfg = get_default_controller_config("JOINT_POSITION")
         robot_interface._state_buffer = []
+        if not wait_for_robot_state(robot_interface):
+            raise RuntimeError("robot state was not received")
 
         logger.info(
-            "Keys: b=begin, e=end, s=save, d=discard, r=reset joints, q=quit. "
-            "SpaceMouse right button ends recording, or quits while idle."
+            "Keys: b=begin, e=end, s=save success, f=save failure, "
+            "d=discard, r=reset joints, q=quit"
         )
+        record_period = 1.0 / args.record_fps
+        next_record_time = time.monotonic()
 
         with NonBlockingKeyReader() as key_reader:
             running = True
             while running:
+                camera_sample = camera.latest()
+                observation = build_observation(robot_interface, camera_sample)
                 for key in key_reader.read_keys():
                     if key == "b":
-                        episode.begin()
+                        if episode.begin(observation):
+                            next_record_time = time.monotonic()
                     elif key == "e":
-                        episode.stop()
+                        episode.stop(observation)
                     elif key == "s":
-                        episode.save()
+                        episode.save(success=True)
+                    elif key == "f":
+                        episode.save(success=False)
                     elif key == "d":
                         episode.discard()
                     elif key == "q":
                         running = False
                     elif key == "r":
                         if episode.state == "recording":
-                            logger.warning("Joint reset is disabled while recording.")
+                            logger.warning("Joint reset is disabled while recording")
                         else:
                             move_to_reset_joint_positions(
                                 robot_interface,
                                 joint_controller_cfg,
                                 timeout=args.reset_timeout,
                                 tolerance=args.reset_tolerance,
-                                gripper_open=not args.keep_gripper_closed_during_reset,
+                                gripper_open=(
+                                    not args.keep_gripper_closed_during_reset
+                                ),
                             )
                             device.start_control()
-
                 if not running:
                     break
 
@@ -567,39 +579,50 @@ def main():
                 )
                 if action is None:
                     if episode.state == "recording":
-                        episode.stop()
+                        episode.stop(observation)
                         try:
                             device.start_control(preserve_gripper=True)
                         except TypeError:
                             device.start_control()
                         continue
-                    running = False
-                    continue
+                    break
 
-                camera_sample = (
-                    {"camera_capture_wall_time_ns": time.time_ns()}
-                    if camera is None
-                    else camera.latest()
-                )
-                observation = build_observation(robot_interface, camera_sample)
+                scaled_action = scaled_deoxys_action(action, controller_cfg)
                 robot_interface.control(
                     controller_type=args.controller_type,
-                    action=action,
+                    action=np.asarray(action, dtype=np.float64).copy(),
                     controller_cfg=controller_cfg,
                 )
-                episode.append(observation, action)
+
+                now = time.monotonic()
+                if (
+                    episode.state == "recording"
+                    and observation is not None
+                    and now >= next_record_time
+                    and episode.should_record(
+                        scaled_action,
+                        args.no_op_threshold,
+                        args.gripper_hold_frames,
+                    )
+                ):
+                    saved_action = deoxys_delta_to_furniture_bench_action(
+                        scaled_action,
+                        observation["robot_state"]["wrist_pose"],
+                    )
+                    episode.append(observation, saved_action)
+                    next_record_time = now + record_period
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received.")
+        logger.info("Keyboard interrupt received")
     finally:
         if episode is not None and episode.state != "idle":
-            logger.warning("Unsaved in-memory episode was discarded on exit.")
+            logger.warning("Unsaved in-memory episode was discarded on exit")
         try:
             if robot_interface is not None:
                 try:
                     if controller_cfg is not None:
                         robot_interface.control(
                             controller_type=args.controller_type,
-                            action=[0.0] * 6 + [1.0],
+                            action=np.array([0.0] * 6 + [1.0]),
                             controller_cfg=controller_cfg,
                             termination=True,
                         )
@@ -608,6 +631,7 @@ def main():
         finally:
             if camera is not None:
                 camera.stop()
+            writer.close()
 
 
 if __name__ == "__main__":
