@@ -32,15 +32,31 @@ from deoxys.utils.log_utils import get_deoxys_example_logger
 
 logger = get_deoxys_example_logger()
 
+# Original reset joint positions (original).
+# RESET_JOINT_POSITIONS = [
+#     0.09162008114028396,
+#     -0.19826458111314524,
+#     -0.01990020486871322,
+#     -2.4732269941140346,
+#     -0.01307073642274261,
+#     2.30396583422025,
+#     0.8480939705504309,
+# ]
+
+# Reset pose with the end effector lowered 10 cm along the robot-base -Z axis
+# while preserving the original XY position and orientation (下降 10 cm).
 RESET_JOINT_POSITIONS = [
-    0.09162008114028396,
-    -0.19826458111314524,
-    -0.01990020486871322,
-    -2.4732269941140346,
-    -0.01307073642274261,
-    2.30396583422025,
-    0.8480939705504309,
+    0.0916502534874562,
+    0.006205358472252432,
+    -0.02085815329544379,
+    -2.552429972459778,
+    -0.010695882435351968,
+    2.587622772050635,
+    0.8472435743003388,
 ]
+
+PREVIEW_WINDOW_NAME = "FurnitureBench SpaceMouse data collection"
+LIVE_PART_NAMES = {0: "tabletop", 4: "movable_leg"}
 
 
 class NonBlockingKeyReader:
@@ -142,6 +158,181 @@ def build_observation(robot_interface, camera_sample):
         }
     )
     return observation
+
+
+def _record_intrinsics_matrix(record_intrinsics):
+    return np.array(
+        [
+            [record_intrinsics["fx"], 0.0, record_intrinsics["ppx"]],
+            [0.0, record_intrinsics["fy"], record_intrinsics["ppy"]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _draw_front_part_poses(
+    front_bgr,
+    camera_sample,
+    record_intrinsics,
+    axis_length=0.035,
+):
+    """Draw live P0/P4 poses without modifying the recorded RGB image."""
+    preview = front_bgr.copy()
+    camera_to_april = camera_sample.get("camera_to_april")
+    parts_poses = camera_sample.get("parts_poses")
+    valid = camera_sample.get("parts_pose_valid")
+    if camera_to_april is None or parts_poses is None or valid is None:
+        return preview
+
+    camera_to_april = np.asarray(camera_to_april, dtype=np.float64)
+    parts_poses = np.asarray(parts_poses, dtype=np.float64).reshape(-1, 7)
+    valid = np.asarray(valid, dtype=bool).reshape(-1)
+    if (
+        camera_to_april.shape != (4, 4)
+        or not np.all(np.isfinite(camera_to_april))
+    ):
+        return preview
+
+    found = np.asarray(
+        camera_sample.get("parts_founds", np.zeros(len(valid), dtype=bool)),
+        dtype=bool,
+    ).reshape(-1)
+    age_ms = np.asarray(
+        camera_sample.get(
+            "parts_pose_age_ms",
+            np.full(len(valid), np.inf, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    ).reshape(-1)
+    april_to_camera = np.linalg.inv(camera_to_april)
+    intrinsics_matrix = _record_intrinsics_matrix(record_intrinsics)
+    distortion = np.zeros(5, dtype=np.float64)
+
+    for part_index, part_name in LIVE_PART_NAMES.items():
+        if part_index >= len(valid) or not valid[part_index]:
+            continue
+        pose = parts_poses[part_index]
+        if not np.all(np.isfinite(pose)):
+            continue
+
+        part_to_april = np.eye(4, dtype=np.float64)
+        part_to_april[:3, :3] = transform_utils.quat2mat(pose[3:7])
+        part_to_april[:3, 3] = pose[:3]
+        part_to_camera = april_to_camera @ part_to_april
+        if part_to_camera[2, 3] <= 0.0:
+            continue
+
+        rotation_vector, _ = cv2.Rodrigues(part_to_camera[:3, :3])
+        translation_vector = part_to_camera[:3, 3]
+        cv2.drawFrameAxes(
+            preview,
+            intrinsics_matrix,
+            distortion,
+            rotation_vector,
+            translation_vector,
+            float(axis_length),
+            2,
+        )
+        origin, _ = cv2.projectPoints(
+            np.zeros((1, 3), dtype=np.float64),
+            rotation_vector,
+            translation_vector,
+            intrinsics_matrix,
+            distortion,
+        )
+        origin_x, origin_y = np.rint(origin.reshape(2)).astype(int)
+        is_found = part_index < len(found) and bool(found[part_index])
+        color = (0, 255, 0) if is_found else (0, 191, 255)
+        if is_found:
+            state_text = "FOUND"
+        else:
+            age = age_ms[part_index] if part_index < len(age_ms) else np.inf
+            state_text = (
+                f"STALE {age:.0f}ms" if np.isfinite(age) else "STALE"
+            )
+        cv2.circle(preview, (origin_x, origin_y), 4, color, -1)
+        cv2.putText(
+            preview,
+            f"P{part_index} {part_name} {state_text}",
+            (origin_x + 6, origin_y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return preview
+
+
+def _build_camera_preview(
+    camera_sample,
+    camera_info,
+    episode_state,
+    draw_part_poses,
+):
+    if camera_sample is None:
+        return None
+    if "color_image1" not in camera_sample or "color_image2" not in camera_sample:
+        return None
+
+    wrist = cv2.cvtColor(camera_sample["color_image1"], cv2.COLOR_RGB2BGR)
+    front = cv2.cvtColor(camera_sample["color_image2"], cv2.COLOR_RGB2BGR)
+    if draw_part_poses:
+        front = _draw_front_part_poses(
+            front,
+            camera_sample,
+            camera_info["front"]["record_intrinsics"],
+        )
+
+    valid = np.asarray(
+        camera_sample.get("parts_pose_valid", np.zeros(6, dtype=bool)),
+        dtype=bool,
+    )
+    found = np.asarray(
+        camera_sample.get("parts_founds", np.zeros(6, dtype=bool)),
+        dtype=bool,
+    )
+    valid_text = "".join("1" if value else "0" for value in valid)
+    found_text = "".join("1" if value else "0" for value in found)
+    base_samples = int(camera_sample.get("camera_pose_samples", 0))
+    base_required = int(camera_sample.get("camera_pose_samples_required", 0))
+    cv2.putText(
+        wrist,
+        f"WRIST  state={episode_state}",
+        (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        front,
+        f"FRONT  pose={'ON' if draw_part_poses else 'OFF'}",
+        (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        front,
+        f"base={base_samples}/{base_required} found={found_text} valid={valid_text}",
+        (8, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    combined = cv2.hconcat([wrist, front])
+    return cv2.resize(
+        combined,
+        (combined.shape[1] * 2, combined.shape[0] * 2),
+        interpolation=cv2.INTER_LINEAR,
+    )
 
 
 def _write_video_atomic(output_path, observations, fps):
@@ -471,6 +662,8 @@ def parse_args():
     parser.add_argument("--no-op-threshold", type=float, default=1e-5)
     parser.add_argument("--gripper-hold-frames", type=int, default=8)
     parser.add_argument("--no-video", action="store_true")
+    parser.add_argument("--draw-part-poses", action="store_true")
+    parser.add_argument("--no-camera-preview", action="store_true")
     parser.add_argument("--reset-timeout", type=float, default=7.0)
     parser.add_argument("--reset-tolerance", type=float, default=1e-3)
     parser.add_argument("--keep-gripper-closed-during-reset", action="store_true")
@@ -513,11 +706,12 @@ def main():
             wrist_depth_fps=args.wrist_depth_fps,
         )
         camera.start()
+        camera_info = camera.metadata()
         episode = RawEpisodeRecorder(
             data_root=args.data_root,
             task_name=args.task_name,
             randomness=args.randomness,
-            camera_info=camera.metadata(),
+            camera_info=camera_info,
             writer=writer,
         )
 
@@ -532,17 +726,31 @@ def main():
 
         logger.info(
             "Keys: b=begin, e=end, s=save success, f=save failure, "
-            "d=discard, r=reset joints, q=quit"
+            "d=discard, r=reset joints, p=toggle part poses, q=quit"
         )
         record_period = 1.0 / args.record_fps
         next_record_time = time.monotonic()
+        draw_part_poses = bool(args.draw_part_poses)
 
         with NonBlockingKeyReader() as key_reader:
             running = True
             while running:
                 camera_sample = camera.latest()
                 observation = build_observation(robot_interface, camera_sample)
-                for key in key_reader.read_keys():
+                keys = key_reader.read_keys()
+                if not args.no_camera_preview:
+                    preview = _build_camera_preview(
+                        camera_sample,
+                        camera_info,
+                        episode.state,
+                        draw_part_poses,
+                    )
+                    if preview is not None:
+                        cv2.imshow(PREVIEW_WINDOW_NAME, preview)
+                        window_key = cv2.waitKey(1) & 0xFF
+                        if window_key in map(ord, "besfdrpq"):
+                            keys.append(chr(window_key))
+                for key in keys:
                     if key == "b":
                         if episode.begin(observation):
                             next_record_time = time.monotonic()
@@ -554,6 +762,12 @@ def main():
                         episode.save(success=False)
                     elif key == "d":
                         episode.discard()
+                    elif key == "p":
+                        draw_part_poses = not draw_part_poses
+                        logger.info(
+                            "Front part-pose overlay %s",
+                            "enabled" if draw_part_poses else "disabled",
+                        )
                     elif key == "q":
                         running = False
                     elif key == "r":
@@ -631,6 +845,8 @@ def main():
         finally:
             if camera is not None:
                 camera.stop()
+            if not args.no_camera_preview:
+                cv2.destroyAllWindows()
             writer.close()
 
 

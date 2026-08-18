@@ -321,7 +321,8 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
-  --product-id 50746
+  --product-id 50746 \
+  --draw-part-poses
 ```
 
 默认配置是 front `1280x720@30` RGB-D、wrist `640x480@30` RGB-D、数据记录
@@ -351,7 +352,8 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --wrist-depth-width 480 \
   --wrist-depth-height 270 \
   --wrist-depth-fps 15 \
-  --record-fps 10
+  --record-fps 10 \
+  --draw-part-poses
 ```
 
 这套降级配置保留 front `1280x720`，因此不会牺牲 AprilTag 检测所需的 front RGB
@@ -364,10 +366,22 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 
 ### 按键与保存结果
 
+脚本默认实时显示写入 pickle 前的 wrist/front RGB 拼接画面；推荐命令均添加
+`--draw-part-poses`，在 front 画面上绘制 `P0 tabletop` 和 `P4 movable_leg` 的
+三维坐标轴。坐标轴使用与 front camera setup 相同的 `camera_to_april` 求逆、
+Rodrigues 和 `cv2.drawFrameAxes` 投影流程。绿色 `FOUND` 表示当前帧成功检测，黄色
+`STALE` 表示暂时使用上一次检测位姿及其 age。配置初始化的 `P1/P2/P3` 和固定障碍物
+`P5` 不会伪装成实时检测结果。
+
 按键：`b` 开始、`e` 结束、`s` 保存为成功、`f` 保存为失败、`d` 丢弃、`r` 关节
-复位、`q` 退出。只有 front 已经得到 tabletop 和可动腿的位姿时才允许开始录制。
-短暂的 AprilTag 遮挡会保留最后一次位姿，同时用 `parts_founds`、
-`parts_pose_valid` 和 `parts_pose_age_ms` 标记是否为当前帧检测以及位姿新鲜度。
+复位、`p` 实时开关 part-pose 绘制、`q` 退出。OpenCV 预览窗口获得焦点时这些按键
+同样有效。只有 front 已经得到 tabletop 和可动腿的位姿时才允许开始录制。短暂的
+AprilTag 遮挡会保留最后一次位姿，同时用 `parts_founds`、`parts_pose_valid` 和
+`parts_pose_age_ms` 标记是否为当前帧检测以及位姿新鲜度。
+
+预览和坐标轴只用于屏幕显示，不会写入 pickle RGB 或保存的 MP4。没有图形桌面或
+通过普通 SSH 启动时，添加 `--no-camera-preview`；该参数只关闭窗口，不影响相机
+采集和 `parts_poses` 计算。
 
 原始 episode 保存到：
 
