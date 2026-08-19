@@ -3,7 +3,9 @@ import unittest
 import numpy as np
 
 from examples.run_deoxys_with_space_mouse_V3_record import (
+    RawEpisodeRecorder,
     _build_camera_preview,
+    _camera_sample_with_prompt_depth,
     _draw_front_part_poses,
 )
 
@@ -15,6 +17,8 @@ def camera_sample(part_z=1.0):
     return {
         "color_image1": np.zeros((240, 320, 3), dtype=np.uint8),
         "color_image2": np.zeros((240, 320, 3), dtype=np.uint8),
+        "depth_image1": np.full((240, 320), 0.5, dtype=np.float32),
+        "depth_image2": np.full((240, 320), 1.0, dtype=np.float32),
         "parts_poses": parts_poses.reshape(-1),
         "parts_founds": np.array([True, False, False, False, False, False]),
         "parts_pose_valid": np.array([True, False, False, False, False, False]),
@@ -36,6 +40,111 @@ RECORD_INTRINSICS = {
 
 
 class PartPosePreviewTest(unittest.TestCase):
+    def test_prompt_depth_sample_saves_enhanced_and_original_depth(self):
+        sample = camera_sample(part_z=1.0)
+        sample["camera_capture_wall_time_ns"] = 123
+        original_wrist = sample["depth_image1"].copy()
+        original_front = sample["depth_image2"].copy()
+        prompt_result = {
+            "camera_sample": sample,
+            "depths": {
+                "depth_image1": np.full((240, 320), 0.6, dtype=np.float32),
+                "depth_image2": np.full((240, 320), 1.1, dtype=np.float32),
+            },
+        }
+
+        enhanced = _camera_sample_with_prompt_depth(
+            prompt_result,
+            ("wrist", "front"),
+        )
+
+        self.assertIsNotNone(enhanced)
+        self.assertEqual(enhanced["depth_image1"].shape, (240, 320))
+        self.assertEqual(enhanced["depth_image2"].shape, (240, 320))
+        self.assertEqual(enhanced["depth_image1"].dtype, np.float16)
+        self.assertEqual(enhanced["depth_image2"].dtype, np.float16)
+        np.testing.assert_allclose(enhanced["depth_image1"], 0.6, atol=1e-3)
+        np.testing.assert_allclose(enhanced["depth_image2"], 1.1, atol=1e-3)
+        np.testing.assert_array_equal(
+            enhanced["depth_image1_realsense"],
+            original_wrist,
+        )
+        np.testing.assert_array_equal(
+            enhanced["depth_image2_realsense"],
+            original_front,
+        )
+        self.assertEqual(enhanced["prompt_depth_source_wall_time_ns"], 123)
+        np.testing.assert_array_equal(sample["depth_image1"], original_wrist)
+        np.testing.assert_array_equal(sample["depth_image2"], original_front)
+
+    def test_prompt_depth_sample_waits_for_every_selected_camera(self):
+        sample = camera_sample(part_z=1.0)
+        prompt_result = {
+            "camera_sample": sample,
+            "depths": {
+                "depth_image2": np.full((240, 320), 1.1, dtype=np.float32),
+            },
+        }
+
+        enhanced = _camera_sample_with_prompt_depth(
+            prompt_result,
+            ("wrist", "front"),
+        )
+
+        self.assertIsNone(enhanced)
+
+    def test_episode_payload_keeps_enhanced_depth_and_prompt_metadata(self):
+        class CapturingWriter:
+            def __init__(self):
+                self.payload = None
+
+            def submit(self, output_path, payload):
+                self.payload = payload
+
+        sample = camera_sample(part_z=1.0)
+        sample["parts_pose_valid"][4] = True
+        prompt_result = {
+            "camera_sample": sample,
+            "depths": {
+                "depth_image1": np.full((240, 320), 0.6, dtype=np.float32),
+                "depth_image2": np.full((240, 320), 1.1, dtype=np.float32),
+            },
+        }
+        enhanced = _camera_sample_with_prompt_depth(
+            prompt_result,
+            ("wrist", "front"),
+        )
+        prompt_config = {
+            "online": True,
+            "model": "vitl",
+            "max_size": 448,
+        }
+        writer = CapturingWriter()
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/promptda-test",
+            task_name="one_leg",
+            randomness="low",
+            camera_info={},
+            writer=writer,
+            prompt_depth_config=prompt_config,
+        )
+
+        self.assertTrue(recorder.begin(enhanced))
+        recorder.append(enhanced, np.zeros(8, dtype=np.float32))
+        recorder.stop(enhanced)
+        recorder.save(success=True)
+
+        self.assertIsNotNone(writer.payload)
+        saved = writer.payload["observations"][0]
+        self.assertEqual(saved["depth_image1"].dtype, np.float16)
+        self.assertEqual(saved["depth_image2"].dtype, np.float16)
+        self.assertIn("depth_image1_realsense", saved)
+        self.assertIn("depth_image2_realsense", saved)
+        self.assertEqual(
+            writer.payload["metadata"]["prompt_depth_anything"],
+            prompt_config,
+        )
+
     def test_draws_visible_part_pose_without_mutating_input(self):
         sample = camera_sample(part_z=1.0)
         front = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -79,6 +188,31 @@ class PartPosePreviewTest(unittest.TestCase):
         self.assertEqual(preview.shape, (480, 1280, 3))
         np.testing.assert_array_equal(sample["color_image1"], wrist_before)
         np.testing.assert_array_equal(sample["color_image2"], front_before)
+
+    def test_prompt_depth_preview_shows_two_exact_camera_rows(self):
+        sample = camera_sample(part_z=1.0)
+        camera_info = {"front": {"record_intrinsics": RECORD_INTRINSICS}}
+        prompt_result = {
+            "camera_sample": sample,
+            "depths": {
+                "depth_image1": np.full((240, 320), 0.6, dtype=np.float32),
+                "depth_image2": np.full((240, 320), 1.1, dtype=np.float32),
+            },
+            "stats": {
+                "wrist": {"inference_ms": 12.0},
+                "front": {"inference_ms": 13.0},
+            },
+        }
+
+        preview = _build_camera_preview(
+            sample,
+            camera_info,
+            episode_state="idle",
+            draw_part_poses=True,
+            prompt_depth_result=prompt_result,
+        )
+
+        self.assertEqual(preview.shape, (480, 960, 3))
 
 
 if __name__ == "__main__":

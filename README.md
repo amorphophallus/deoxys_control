@@ -142,6 +142,7 @@ cd /home/hz/code
 git clone --branch main --recurse-submodules \
   git@github.com:amorphophallus/robust-rearrangement-custom.git
 git -C /home/hz/code/robust-rearrangement-custom submodule update --init --recursive
+git -C /home/hz/code/YueHu_deoxys submodule update --init --recursive
 ```
 
 FrankaControl 的 `/home/hz/.bashrc` 已配置以下环境变量，新机器部署时需要保持相同
@@ -164,7 +165,7 @@ export PYTHONPATH="$DEOXYS_ROOT:$ROBUST_REARRANGEMENT_ROOT:$FURNITURE_BENCH${PYT
 source ~/.bashrc
 conda activate deoxys
 pip install "$FURNITURE_BENCH/wheels/dt_apriltags-3.2.0-py3-none-manylinux2010_x86_64.whl" \
-  ipdb gym==0.26.2
+  ipdb gym==0.26.2 huggingface-hub
 ```
 
 ## 每次开始 setup 前：进入环境
@@ -216,6 +217,17 @@ python -m deoxys.examples.furniture_bench_setup_deoxys calibrate \
 - `x/y/z pos` 均为绿色，每轴误差不超过 `0.004 m`。
 - `x/y/z rot` 均为绿色，每轴误差不超过 `0.8 deg`。
 - 数字变绿的同时，实时画面轮廓也必须与透明参考图对齐。
+
+当前人工调整结果可参考 2026-08-19 的标定截图；这是校准界面显示值，不是需要
+写死到程序里的相机外参：
+
+```text
+x/y/z pos [m]   = [-0.0038, -0.1384, -0.0102]
+x/y/z rot [deg] = [-12.0203, -0.4771, -0.2179]
+```
+
+该视角优先保证标准初始摆放下零件 AprilTag 可见、`valid` 全为 `1`；重新安装支架
+或移动相机后仍须重新执行标定和第 4 步测试，不能直接照抄上述数值。
 
 完成后按 `q` 或 `Esc` 退出。在完成第 2、3 步之前不要移动 base AprilTag 或
 front camera；否则透明参考图不再对应真实视角。
@@ -322,7 +334,12 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --product-id 50746 \
-  --draw-part-poses
+  --draw-part-poses \
+  --prompt-depth-anything \
+  --prompt-depth-model vitl \
+  --prompt-depth-cameras both \
+  --prompt-depth-max-size 448 \
+  --prompt-depth-colormap viridis
 ```
 
 默认配置是 front `1280x720@30` RGB-D、wrist `640x480@30` RGB-D、数据记录
@@ -353,7 +370,12 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --wrist-depth-height 270 \
   --wrist-depth-fps 15 \
   --record-fps 10 \
-  --draw-part-poses
+  --draw-part-poses \
+  --prompt-depth-anything \
+  --prompt-depth-model vitl \
+  --prompt-depth-cameras both \
+  --prompt-depth-max-size 448 \
+  --prompt-depth-colormap viridis
 ```
 
 这套降级配置保留 front `1280x720`，因此不会牺牲 AprilTag 检测所需的 front RGB
@@ -416,3 +438,65 @@ RGB-D 为 `640x480@30`。图像处理没有 `1280x720 -> 640x480 -> 320x240` 这
 
 pickle 和左右相机拼接 MP4 会由后台线程先写临时文件，再原子重命名。退出程序前应
 等待保存完成，不要在终端刚显示保存按键后立即关机。
+
+## Prompt Depth Anything 深度增强
+
+本仓库把官方 Prompt Depth Anything 固定为 `third_party/PromptDA` submodule。
+新机器第一次使用前复制执行：
+
+```shell
+source ~/.bashrc
+conda activate deoxys
+cd /home/hz/code/YueHu_deoxys
+git submodule update --init --recursive
+pip install huggingface-hub
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+推荐 ViT-L、`max-size 448` 和 `320x240` 保存分辨率，因为双相机实测约
+`16.79 observation/s`，能够覆盖当前 `10 Hz` 数采频率且已经确认视觉效果。
+
+### 方案一：在线预览并保存增强深度
+
+SpaceMouse record 新增的 PromptDA 参数会实时显示 wrist/front 的 RGB、原始 depth
+和增强 depth，同时把增强后的 `320x240 float16` 米制 depth 保存到 pickle 的
+`depth_image1/2`；原始 RealSense depth 保存在 `depth_image1/2_realsense`。
+
+```shell
+source ~/.bashrc
+conda activate deoxys
+cd /home/hz/code/YueHu_deoxys/deoxys
+export HF_ENDPOINT=https://hf-mirror.com
+
+python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
+  --interface-cfg config/charmander.yml \
+  --controller-type OSC_POSE \
+  --vendor-id 9583 \
+  --product-id 50746 \
+  --record-image-width 320 \
+  --record-image-height 240 \
+  --record-fps 10 \
+  --draw-part-poses \
+  --prompt-depth-anything \
+  --prompt-depth-model vitl \
+  --prompt-depth-cameras both \
+  --prompt-depth-max-size 448 \
+  --prompt-depth-colormap viridis
+```
+
+### 方案二：离线处理已有 pickle
+
+对以前保存的原始 RealSense pickle 使用下面的命令；脚本不会修改输入文件，而是生成
+新的 ViT-L 增强 pickle、指标 JSON 和双相机对比 MP4。
+
+```shell
+python -m deoxys.examples.process_pickle_prompt_depth \
+  "$DATA_DIR_RAW/raw/osc/real/one_leg/teleop/low/success/示例.pkl" \
+  --model vitl \
+  --max-size 448 \
+  --cameras both \
+  --comparison-video
+```
+
+输出文件名为 `示例_promptda_vitl.pkl`、`示例_promptda_vitl.metrics.json` 和
+`示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与在线方案一致。

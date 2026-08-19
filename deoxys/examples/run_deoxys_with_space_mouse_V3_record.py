@@ -28,6 +28,13 @@ from deoxys.utils.furniture_bench_utils import (
 from deoxys.utils.input_utils import input2action
 from deoxys.utils.io_devices import SpaceMouse
 from deoxys.utils.log_utils import get_deoxys_example_logger
+from deoxys.utils.prompt_depth_anything import (
+    PromptDepthAnythingEstimator,
+    PromptDepthWorker,
+    colorize_depth,
+    depth_display_bounds,
+)
+from deoxys.utils.video_utils import H264VideoWriter
 
 
 logger = get_deoxys_example_logger()
@@ -57,6 +64,10 @@ RESET_JOINT_POSITIONS = [
 
 PREVIEW_WINDOW_NAME = "FurnitureBench SpaceMouse data collection"
 LIVE_PART_NAMES = {0: "tabletop", 4: "movable_leg"}
+PROMPT_DEPTH_FIELDS = {
+    "wrist": "depth_image1",
+    "front": "depth_image2",
+}
 
 
 class NonBlockingKeyReader:
@@ -158,6 +169,38 @@ def build_observation(robot_interface, camera_sample):
         }
     )
     return observation
+
+
+def _camera_sample_with_prompt_depth(prompt_result, cameras):
+    if not prompt_result:
+        return None
+    source_sample = prompt_result.get("camera_sample")
+    enhanced_depths = prompt_result.get("depths") or {}
+    if source_sample is None:
+        return None
+
+    required_depth_keys = [PROMPT_DEPTH_FIELDS[name] for name in cameras]
+    if any(depth_key not in enhanced_depths for depth_key in required_depth_keys):
+        return None
+
+    sample = {
+        key: value.copy() if isinstance(value, np.ndarray) else value
+        for key, value in source_sample.items()
+    }
+    for depth_key in required_depth_keys:
+        raw_depth = np.asarray(source_sample[depth_key])
+        enhanced_depth = np.asarray(enhanced_depths[depth_key], dtype=np.float32)
+        if enhanced_depth.shape != raw_depth.shape:
+            raise ValueError(
+                f"PromptDA {depth_key} shape mismatch: "
+                f"{enhanced_depth.shape} vs {raw_depth.shape}"
+            )
+        sample[f"{depth_key}_realsense"] = raw_depth.copy()
+        sample[depth_key] = enhanced_depth.astype(np.float16)
+    sample["prompt_depth_source_wall_time_ns"] = source_sample.get(
+        "camera_capture_wall_time_ns"
+    )
+    return sample
 
 
 def _record_intrinsics_matrix(record_intrinsics):
@@ -270,6 +313,10 @@ def _build_camera_preview(
     camera_info,
     episode_state,
     draw_part_poses,
+    prompt_depth_result=None,
+    depth_min_m=0.05,
+    depth_max_m=3.0,
+    depth_colormap="viridis",
 ):
     if camera_sample is None:
         return None
@@ -327,6 +374,86 @@ def _build_camera_preview(
         1,
         cv2.LINE_AA,
     )
+    if prompt_depth_result and prompt_depth_result.get("depths"):
+        depths = prompt_depth_result["depths"]
+        wrist_min, wrist_max = depth_display_bounds(
+            camera_sample["depth_image1"], depth_min_m, depth_max_m
+        )
+        front_min, front_max = depth_display_bounds(
+            camera_sample["depth_image2"], depth_min_m, depth_max_m
+        )
+        wrist_raw = colorize_depth(
+            camera_sample["depth_image1"],
+            wrist_min,
+            wrist_max,
+            depth_colormap,
+        )
+        front_raw = colorize_depth(
+            camera_sample["depth_image2"],
+            front_min,
+            front_max,
+            depth_colormap,
+        )
+        wrist_enhanced = colorize_depth(
+            depths.get("depth_image1", camera_sample["depth_image1"]),
+            wrist_min,
+            wrist_max,
+            depth_colormap,
+        )
+        front_enhanced = colorize_depth(
+            depths.get("depth_image2", camera_sample["depth_image2"]),
+            front_min,
+            front_max,
+            depth_colormap,
+        )
+        for panel, text in (
+            (wrist_raw, f"WRIST RealSense {wrist_min:.2f}-{wrist_max:.2f}m"),
+            (wrist_enhanced, f"WRIST PromptDA {wrist_min:.2f}-{wrist_max:.2f}m"),
+            (front_raw, f"FRONT RealSense {front_min:.2f}-{front_max:.2f}m"),
+            (front_enhanced, f"FRONT PromptDA {front_min:.2f}-{front_max:.2f}m"),
+        ):
+            cv2.putText(
+                panel,
+                text,
+                (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        wrist_ms = prompt_depth_result.get("stats", {}).get("wrist", {}).get(
+            "inference_ms"
+        )
+        front_ms = prompt_depth_result.get("stats", {}).get("front", {}).get(
+            "inference_ms"
+        )
+        timing = " / ".join(
+            text
+            for text in (
+                f"wrist {wrist_ms:.0f} ms" if wrist_ms is not None else "",
+                f"front {front_ms:.0f} ms" if front_ms is not None else "",
+            )
+            if text
+        )
+        if timing:
+            cv2.putText(
+                wrist_enhanced,
+                timing,
+                (8, wrist_enhanced.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        return cv2.vconcat(
+            [
+                cv2.hconcat([wrist, wrist_raw, wrist_enhanced]),
+                cv2.hconcat([front, front_raw, front_enhanced]),
+            ]
+        )
+
     combined = cv2.hconcat([wrist, front])
     return cv2.resize(
         combined,
@@ -348,12 +475,7 @@ def _write_video_atomic(output_path, observations, fps):
 
     temporary_path = output_path.with_name(output_path.stem + ".tmp.mp4")
     height, width = frames[0].shape[:2]
-    writer = cv2.VideoWriter(
-        str(temporary_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps),
-        (width, height),
-    )
+    writer = H264VideoWriter(temporary_path, fps, frames[0].shape)
     if not writer.isOpened():
         raise RuntimeError(f"failed to open video writer for {temporary_path}")
     try:
@@ -421,12 +543,14 @@ class RawEpisodeRecorder:
         randomness,
         camera_info,
         writer,
+        prompt_depth_config=None,
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
         self.randomness = randomness
         self.camera_info = camera_info
         self.writer = writer
+        self.prompt_depth_config = prompt_depth_config
         self.observations = []
         self.actions = []
         self.started_at = None
@@ -555,6 +679,7 @@ class RawEpisodeRecorder:
                 "stopped_at": self.stopped_at,
                 "num_observations": len(self.observations),
                 "num_actions": len(self.actions),
+                "prompt_depth_anything": self.prompt_depth_config,
             },
         }
         self.writer.submit(output_path, payload)
@@ -664,6 +789,34 @@ def parse_args():
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--draw-part-poses", action="store_true")
     parser.add_argument("--no-camera-preview", action="store_true")
+    parser.add_argument(
+        "--prompt-depth-anything",
+        action="store_true",
+        help=(
+            "enhance recorded depth in a background thread and show "
+            "RGB/raw/enhanced depth"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-depth-model",
+        choices=("vits", "vitl", "vits-transparent"),
+        default="vits",
+    )
+    parser.add_argument("--prompt-depth-device", default="cuda")
+    parser.add_argument("--prompt-depth-max-size", type=int, default=448)
+    parser.add_argument(
+        "--prompt-depth-cameras",
+        choices=("both", "front", "wrist"),
+        default="both",
+    )
+    parser.add_argument("--prompt-depth-min-m", type=float, default=0.05)
+    parser.add_argument("--prompt-depth-max-m", type=float, default=5.0)
+    parser.add_argument("--prompt-depth-display-max-m", type=float, default=3.0)
+    parser.add_argument(
+        "--prompt-depth-colormap",
+        choices=("viridis", "turbo", "inferno", "jet"),
+        default="viridis",
+    )
     parser.add_argument("--reset-timeout", type=float, default=7.0)
     parser.add_argument("--reset-tolerance", type=float, default=1e-3)
     parser.add_argument("--keep-gripper-closed-during-reset", action="store_true")
@@ -678,6 +831,9 @@ def parse_args():
 def main():
     args = parse_args()
     camera = None
+    prompt_depth_worker = None
+    prompt_depth_cameras = ()
+    prompt_depth_config = None
     episode = None
     writer = EpisodeWriter(
         video_fps=args.record_fps,
@@ -707,12 +863,41 @@ def main():
         )
         camera.start()
         camera_info = camera.metadata()
+        if args.prompt_depth_anything:
+            prompt_depth_cameras = (
+                ("wrist", "front")
+                if args.prompt_depth_cameras == "both"
+                else (args.prompt_depth_cameras,)
+            )
+            prompt_depth_worker = PromptDepthWorker(
+                PromptDepthAnythingEstimator(
+                    model=args.prompt_depth_model,
+                    device=args.prompt_depth_device,
+                    max_size=args.prompt_depth_max_size,
+                    min_depth_m=args.prompt_depth_min_m,
+                    max_depth_m=args.prompt_depth_max_m,
+                ),
+                cameras=prompt_depth_cameras,
+            )
+            prompt_depth_worker.start()
+            prompt_depth_config = {
+                "online": True,
+                "model": args.prompt_depth_model,
+                "max_size": args.prompt_depth_max_size,
+                "prompt_size": [256, 192],
+                "cameras": list(prompt_depth_cameras),
+                "canonical_depth_fields": [
+                    PROMPT_DEPTH_FIELDS[name] for name in prompt_depth_cameras
+                ],
+                "original_depth_suffix": "_realsense",
+            }
         episode = RawEpisodeRecorder(
             data_root=args.data_root,
             task_name=args.task_name,
             randomness=args.randomness,
             camera_info=camera_info,
             writer=writer,
+            prompt_depth_config=prompt_depth_config,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
@@ -731,19 +916,46 @@ def main():
         record_period = 1.0 / args.record_fps
         next_record_time = time.monotonic()
         draw_part_poses = bool(args.draw_part_poses)
+        prompt_depth_error = None
 
         with NonBlockingKeyReader() as key_reader:
             running = True
             while running:
                 camera_sample = camera.latest()
-                observation = build_observation(robot_interface, camera_sample)
+                prompt_result = None
+                observation_camera_sample = camera_sample
+                if prompt_depth_worker is not None:
+                    prompt_depth_worker.submit(camera_sample)
+                    prompt_result = prompt_depth_worker.latest()
+                    observation_camera_sample = _camera_sample_with_prompt_depth(
+                        prompt_result,
+                        prompt_depth_cameras,
+                    )
+                    if prompt_result is not None and prompt_result.get("error"):
+                        if prompt_result["error"] != prompt_depth_error:
+                            prompt_depth_error = prompt_result["error"]
+                            logger.error(
+                                "PromptDA processing failed: %s",
+                                prompt_depth_error,
+                            )
+                observation = build_observation(
+                    robot_interface,
+                    observation_camera_sample,
+                )
                 keys = key_reader.read_keys()
                 if not args.no_camera_preview:
+                    preview_sample = camera_sample
+                    if prompt_result is not None and prompt_result.get("depths"):
+                        preview_sample = prompt_result["camera_sample"]
                     preview = _build_camera_preview(
-                        camera_sample,
+                        preview_sample,
                         camera_info,
                         episode.state,
                         draw_part_poses,
+                        prompt_depth_result=prompt_result,
+                        depth_min_m=args.prompt_depth_min_m,
+                        depth_max_m=args.prompt_depth_display_max_m,
+                        depth_colormap=args.prompt_depth_colormap,
                     )
                     if preview is not None:
                         cv2.imshow(PREVIEW_WINDOW_NAME, preview)
@@ -843,6 +1055,8 @@ def main():
                 finally:
                     robot_interface.close()
         finally:
+            if prompt_depth_worker is not None:
+                prompt_depth_worker.stop()
             if camera is not None:
                 camera.stop()
             if not args.no_camera_preview:
