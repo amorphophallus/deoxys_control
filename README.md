@@ -185,16 +185,28 @@ cd /home/hz/code/YueHu_deoxys/deoxys
 - front：`327122071654`，提供 RGB-D 和 AprilTag 零件定位。
 - wrist：`001622071252`，当前 adapter 提供 RGB-D。
 
-把相机接到 FrankaControl 的 USB 3 接口，然后执行：
+把相机接到 FrankaControl 的 USB 3 接口，然后复制执行：
 
 ```shell
-rs-enumerate-devices -s
+lsusb -t
+rs-enumerate-devices 2>&1 | grep -E \
+  'Name|Serial Number|Physical Port|Usb Type Descriptor|Could not create device'
 ```
 
-输出中应同时出现 `327122071654` 和 `001622071252`。当前 setup 流程会分别启动
-front 和 wrist，兼容两台相机仍共享 `480M` USB 2.0 Hub 的情况。执行下面的
-front-only 命令时可以临时拔掉 wrist；执行 wrist-only 命令时也可以临时拔掉
-front。如果显示 `No device detected`，重新插拔相机后再次检查，不要继续标定。
+当前正式接线是 front 使用 USB 3.x 好线、wrist 使用 USB 2.1 旧线。必须同时满足
+以下条件才算通过：
+
+- `lsusb -t` 中 front 的 RealSense `Video` 接口显示 `5000M`；wrist 允许显示
+  `480M`。
+- `rs-enumerate-devices` 同时列出 front `327122071654` 和 wrist
+  `001622071252`；front 的 `Usb Type Descriptor` 应为 `3.x`，wrist 允许为
+  `2.1`。
+- 输出中没有 `Could not create device`、`xioctl` 或 UVC control timeout。
+
+`lsusb -t` 只证明物理 USB 链路的协商速度，不能单独证明 librealsense 可以正常
+打开相机。如果第二条命令缺少任一序列号，仍然判定为失败；重新插紧相机端
+USB-C、检查线缆和 Hub 后再次执行，不要继续标定或数采。下面的 front-only /
+wrist-only 命令可用于单相机排查。
 
 ## 第 1 步：微调 front camera
 
@@ -324,9 +336,10 @@ df -h "$DATA_DIR_RAW"
 rs-enumerate-devices | grep -E '327122071654|001622071252'
 ```
 
-### USB 3.x / 5000M 正式配置
+### 当前正式混合配置（front USB 3.x + wrist USB 2.1）
 
-新线到达且 `lsusb -t` 中两台相机均显示 `5000M` 后，直接使用默认配置：
+确认 front 显示 `5000M`、wrist 显示 `480M` 且两台相机都能被
+`rs-enumerate-devices` 枚举后，直接使用默认配置：
 
 ```shell
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
@@ -342,14 +355,13 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --prompt-depth-colormap viridis
 ```
 
-默认配置是 front `1280x720@30` RGB-D、wrist `640x480@30` RGB-D、数据记录
-`10 Hz`。这套配置不能在当前两台相机共享的 `480M` Hub 上运行。
+默认配置是 front `1280x720@30` RGB-D、wrist RGB `424x240@30` + depth
+`480x270@30`、数据记录 `10 Hz`。该组合已在 FrankaControl 当前接线下双相机
+并发实测通过。
 
-### 当前 480M / USB 2.1 降级配置
+### 完整参数命令（与默认配置相同）
 
-在新线到达前，可以使用下面这套已经在 FrankaControl 两台相机同时连接、AprilTag
-tracker 开启时实测通过的组合。front 约 `10 FPS`，wrist 约 `15 FPS`，满足当前
-`10 Hz` 数采的最低要求：
+需要显式固定每个相机 profile 时，复制下面的完整命令：
 
 ```shell
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
@@ -359,16 +371,16 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --product-id 50746 \
   --front-color-width 1280 \
   --front-color-height 720 \
-  --front-color-fps 10 \
-  --front-depth-width 848 \
-  --front-depth-height 480 \
-  --front-depth-fps 10 \
+  --front-color-fps 30 \
+  --front-depth-width 1280 \
+  --front-depth-height 720 \
+  --front-depth-fps 30 \
   --wrist-color-width 424 \
   --wrist-color-height 240 \
-  --wrist-color-fps 15 \
+  --wrist-color-fps 30 \
   --wrist-depth-width 480 \
   --wrist-depth-height 270 \
-  --wrist-depth-fps 15 \
+  --wrist-depth-fps 30 \
   --record-fps 10 \
   --draw-part-poses \
   --prompt-depth-anything \
@@ -378,13 +390,10 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --prompt-depth-colormap viridis
 ```
 
-这套降级配置保留 front `1280x720`，因此不会牺牲 AprilTag 检测所需的 front RGB
-像素；主要降低 front depth 和 wrist RGB-D 的带宽。两台相机仍共用一条 USB 2.1
-链路，余量很小，只适合临时采集。启动后如果出现帧超时、FPS 下降或 USB 错误，应
-停止本次采集并等待 `5000M` 线，不要继续保存不完整 episode。USB2 配置的 wrist
-原图为 16:9 的 `424x240`，写入 pickle 时会中央裁出 `320x240`；与正式 USB3 的
-`640x480 -> 320x240` 相比会损失左右视野，因此采集前必须确认腕部关键操作区域仍
-完整可见。
+该配置保留 front `1280x720`，确保 AprilTag 检测所需的 front RGB 像素；wrist
+通过较低分辨率在 USB 2.1 上提供 30 Hz 采样余量。wrist 原图为 16:9 的
+`424x240`，写入 pickle 时会中央裁出 `320x240`，因此采集前必须确认腕部关键操作
+区域仍完整可见。
 
 ### 按键与保存结果
 
