@@ -136,6 +136,8 @@ class SpaceMouse:
         self._reset_state = 0
         self.rotation = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]])
         self._enabled = False
+        self._stop_event = threading.Event()
+        self.device.set_nonblocking(1)
 
         # launch a new listener thread to listen to SpaceMouse
         self.thread = threading.Thread(target=self.run)
@@ -195,6 +197,15 @@ class SpaceMouse:
         self._reset_state = 0
         self._enabled = True
 
+    def close(self):
+        """Stop the listener thread and close the HID device."""
+        if self._stop_event.is_set():
+            return
+        self._enabled = False
+        self._stop_event.set()
+        self.thread.join(timeout=1.0)
+        self.device.close()
+
     def get_controller_state(self):
         """
         Grabs the current state of the 3D mouse.
@@ -225,9 +236,12 @@ class SpaceMouse:
 
         t_last_click = -1
 
-        while True:
+        while not self._stop_event.is_set():
             d = self.device.read(13)
-            if d is not None and self._enabled:
+            if not d:
+                self._stop_event.wait(0.001)
+                continue
+            if self._enabled:
 
                 if self.product_id == 50741:
                     # Older models send translation and rotation in separate reports.

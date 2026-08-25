@@ -68,6 +68,10 @@ PROMPT_DEPTH_FIELDS = {
     "wrist": "depth_image1",
     "front": "depth_image2",
 }
+SPACEMOUSE_PRODUCT_IDS = {
+    "wireless": 50770,  # 0xc652 Universal Receiver
+    "wired": 50746,  # 0xc63a wired connection
+}
 
 
 class NonBlockingKeyReader:
@@ -754,7 +758,17 @@ def parse_args():
     parser.add_argument("--interface-cfg", default="config/charmander.yml")
     parser.add_argument("--controller-type", default="OSC_POSE")
     parser.add_argument("--vendor-id", type=int, default=9583)
-    parser.add_argument("--product-id", type=int, default=50746)
+    parser.add_argument(
+        "--spacemouse-connection",
+        choices=tuple(SPACEMOUSE_PRODUCT_IDS),
+        default="wired",
+    )
+    parser.add_argument(
+        "--product-id",
+        type=int,
+        default=None,
+        help="override the product ID selected by --spacemouse-connection",
+    )
     parser.add_argument("--data-root", default=default_data_root)
     parser.add_argument("--task-name", choices=("one_leg",), default="one_leg")
     parser.add_argument("--randomness", choices=("low",), default="low")
@@ -821,6 +835,8 @@ def parse_args():
     parser.add_argument("--reset-tolerance", type=float, default=1e-3)
     parser.add_argument("--keep-gripper-closed-during-reset", action="store_true")
     args = parser.parse_args()
+    if args.product_id is None:
+        args.product_id = SPACEMOUSE_PRODUCT_IDS[args.spacemouse_connection]
     if not args.data_root:
         parser.error("--data-root is required when DATA_DIR_RAW is not set")
     if args.record_fps <= 0:
@@ -839,6 +855,7 @@ def main():
         video_fps=args.record_fps,
         save_video=not args.no_video,
     )
+    device = None
     robot_interface = None
     controller_cfg = None
     try:
@@ -1055,6 +1072,11 @@ def main():
                 finally:
                     robot_interface.close()
         finally:
+            if device is not None:
+                try:
+                    device.close()
+                except Exception as exc:
+                    logger.warning("Failed to close SpaceMouse cleanly: %s", exc)
             if prompt_depth_worker is not None:
                 prompt_depth_worker.stop()
             if camera is not None:

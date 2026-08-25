@@ -334,7 +334,37 @@ conda activate deoxys
 cd /home/hz/code/YueHu_deoxys/deoxys
 df -h "$DATA_DIR_RAW"
 rs-enumerate-devices | grep -E '327122071654|001622071252'
+lsusb -d 256f:
 ```
+
+### SpaceMouse 有线/无线配置与一次性权限安装
+
+无线连接时 SpaceMouse Universal Receiver 应显示为 `256f:c652`（十进制 product
+ID `50770`）；有线连接使用 `256f:c63a`（十进制 product ID `50746`）。首次使用
+任一种连接，或设备存在但程序报 `OSError: open failed` 时，执行一次：
+
+```shell
+cd /home/hz/code/YueHu_deoxys/deoxys
+bash installation/create_spacemouse.sh
+```
+
+该命令会要求输入 FrankaControl 本机的 sudo 密码，因为它需要向系统目录
+`/etc/udev/rules.d` 写入规则并刷新 USB/hidraw 设备节点。sudo 仅在安装权限规则时
+使用一次；不要用 sudo 启动数采程序，否则输出数据可能变成 root 所有。脚本同时
+覆盖有线 `c63a` 和无线 `c652`。执行后用当前连接对应的一条命令验证：
+
+```shell
+# 无线
+python -c "from deoxys.utils.io_devices import SpaceMouse; d=SpaceMouse(vendor_id=9583, product_id=50770); print('wireless SpaceMouse: OK'); d.close()"
+
+# 有线
+python -c "from deoxys.utils.io_devices import SpaceMouse; d=SpaceMouse(vendor_id=9583, product_id=50746); print('wired SpaceMouse: OK'); d.close()"
+```
+
+若仍报 `OSError: open failed`，重新插拔 SpaceMouse/接收器后再执行验证命令。
+
+数采脚本默认使用更稳定的有线连接。切换到无线接收器时加
+`--spacemouse-connection wireless`；`--product-id` 仅用于覆盖未知型号的 ID。
 
 ### 当前正式混合配置（front USB 3.x + wrist USB 2.1）
 
@@ -346,7 +376,7 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
-  --product-id 50746 \
+  --spacemouse-connection wired \
   --draw-part-poses \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
@@ -368,7 +398,7 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
-  --product-id 50746 \
+  --spacemouse-connection wired \
   --front-color-width 1280 \
   --front-color-height 720 \
   --front-color-fps 30 \
@@ -481,7 +511,7 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
-  --product-id 50746 \
+  --spacemouse-connection wired \
   --record-image-width 320 \
   --record-image-height 240 \
   --record-fps 10 \

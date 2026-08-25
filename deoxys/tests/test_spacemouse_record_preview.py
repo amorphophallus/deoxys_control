@@ -1,12 +1,18 @@
+import os
+import sys
 import unittest
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+from deoxys.utils.io_devices import spacemouse as spacemouse_module
 from examples.run_deoxys_with_space_mouse_V3_record import (
     RawEpisodeRecorder,
+    SPACEMOUSE_PRODUCT_IDS,
     _build_camera_preview,
     _camera_sample_with_prompt_depth,
     _draw_front_part_poses,
+    parse_args,
 )
 
 
@@ -37,6 +43,50 @@ RECORD_INTRINSICS = {
     "width": 320,
     "height": 240,
 }
+
+
+class SpaceMouseConnectionTest(unittest.TestCase):
+    def parse(self, *arguments):
+        with patch.dict(os.environ, {"DATA_DIR_RAW": "/tmp"}):
+            with patch.object(sys, "argv", ["record", *arguments]):
+                return parse_args()
+
+    def test_wired_is_the_default(self):
+        args = self.parse()
+
+        self.assertEqual(args.spacemouse_connection, "wired")
+        self.assertEqual(args.product_id, SPACEMOUSE_PRODUCT_IDS["wired"])
+
+    def test_wireless_connection_selects_wireless_product_id(self):
+        args = self.parse("--spacemouse-connection", "wireless")
+
+        self.assertEqual(args.product_id, SPACEMOUSE_PRODUCT_IDS["wireless"])
+
+    def test_explicit_product_id_overrides_connection(self):
+        args = self.parse(
+            "--spacemouse-connection",
+            "wired",
+            "--product-id",
+            "12345",
+        )
+
+        self.assertEqual(args.product_id, 12345)
+
+    def test_close_stops_listener_and_closes_hid_device(self):
+        hid_device = MagicMock()
+        hid_device.read.return_value = []
+
+        with patch.object(spacemouse_module.hid, "device", return_value=hid_device):
+            device = spacemouse_module.SpaceMouse(
+                vendor_id=9583,
+                product_id=SPACEMOUSE_PRODUCT_IDS["wireless"],
+            )
+            device.start_control()
+            device.close()
+
+        self.assertFalse(device.thread.is_alive())
+        hid_device.set_nonblocking.assert_called_once_with(1)
+        hid_device.close.assert_called_once_with()
 
 
 class PartPosePreviewTest(unittest.TestCase):
