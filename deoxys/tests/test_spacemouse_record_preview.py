@@ -9,6 +9,7 @@ from deoxys.utils.io_devices import spacemouse as spacemouse_module
 from examples.run_deoxys_with_space_mouse_V3_record import (
     RawEpisodeRecorder,
     SPACEMOUSE_PRODUCT_IDS,
+    TASK_PART_NAMES,
     _build_camera_preview,
     _camera_sample_with_prompt_depth,
     _draw_front_part_poses,
@@ -16,8 +17,8 @@ from examples.run_deoxys_with_space_mouse_V3_record import (
 )
 
 
-def camera_sample(part_z=1.0):
-    parts_poses = np.zeros((6, 7), dtype=np.float32)
+def camera_sample(part_z=1.0, pose_count=6):
+    parts_poses = np.zeros((pose_count, 7), dtype=np.float32)
     parts_poses[:, 6] = 1.0
     parts_poses[0, 2] = part_z
     return {
@@ -26,9 +27,9 @@ def camera_sample(part_z=1.0):
         "depth_image1": np.full((240, 320), 0.5, dtype=np.float32),
         "depth_image2": np.full((240, 320), 1.0, dtype=np.float32),
         "parts_poses": parts_poses.reshape(-1),
-        "parts_founds": np.array([True, False, False, False, False, False]),
-        "parts_pose_valid": np.array([True, False, False, False, False, False]),
-        "parts_pose_age_ms": np.zeros(6, dtype=np.float32),
+        "parts_founds": np.arange(pose_count) == 0,
+        "parts_pose_valid": np.arange(pose_count) == 0,
+        "parts_pose_age_ms": np.zeros(pose_count, dtype=np.float32),
         "camera_pose_samples": 10,
         "camera_pose_samples_required": 10,
         "camera_to_april": np.eye(4, dtype=np.float64),
@@ -72,6 +73,16 @@ class SpaceMouseConnectionTest(unittest.TestCase):
 
         self.assertEqual(args.product_id, 12345)
 
+    def test_round_table_task_is_supported(self):
+        args = self.parse("--task-name", "round_table")
+
+        self.assertEqual(args.task_name, "round_table")
+
+    def test_lamp_task_is_supported(self):
+        args = self.parse("--task-name", "lamp")
+
+        self.assertEqual(args.task_name, "lamp")
+
     def test_close_stops_listener_and_closes_hid_device(self):
         hid_device = MagicMock()
         hid_device.read.return_value = []
@@ -90,6 +101,52 @@ class SpaceMouseConnectionTest(unittest.TestCase):
 
 
 class PartPosePreviewTest(unittest.TestCase):
+    def test_round_table_requires_all_three_part_poses(self):
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/round-table-test",
+            task_name="round_table",
+            randomness="low",
+            camera_info={},
+            writer=MagicMock(),
+        )
+        sample = camera_sample(pose_count=3)
+
+        self.assertFalse(recorder._parts_ready(sample))
+        sample["parts_pose_valid"][:] = True
+        self.assertTrue(recorder._parts_ready(sample))
+
+    def test_draws_all_round_table_part_poses(self):
+        sample = camera_sample(part_z=1.0, pose_count=3)
+        sample["parts_poses"] = np.tile(
+            np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            3,
+        )
+        sample["parts_pose_valid"][:] = True
+        front = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        rendered = _draw_front_part_poses(
+            front,
+            sample,
+            RECORD_INTRINSICS,
+            part_names=TASK_PART_NAMES["round_table"],
+        )
+
+        self.assertTrue(np.any(rendered != 0))
+
+    def test_lamp_requires_all_three_part_poses(self):
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/lamp-test",
+            task_name="lamp",
+            randomness="low",
+            camera_info={},
+            writer=MagicMock(),
+        )
+        sample = camera_sample(pose_count=3)
+
+        self.assertFalse(recorder._parts_ready(sample))
+        sample["parts_pose_valid"][:] = True
+        self.assertTrue(recorder._parts_ready(sample))
+
     def test_prompt_depth_sample_saves_enhanced_and_original_depth(self):
         sample = camera_sample(part_z=1.0)
         sample["camera_capture_wall_time_ns"] = 123

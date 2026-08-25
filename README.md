@@ -389,6 +389,69 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 `480x270@30`、数据记录 `10 Hz`。该组合已在 FrankaControl 当前接线下双相机
 并发实测通过。
 
+### Round-table 数采（默认配置，可直接复制）
+
+先完成 `--target round_table` 的相机与零件初始位置 setup，再运行下面的命令。
+这里只增加 `--task-name round_table`，相机 profile、记录频率和 PromptDA 都沿用
+当前默认值：
+
+```shell
+source ~/.bashrc
+conda activate deoxys
+cd /home/hz/code/YueHu_deoxys/deoxys
+
+python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
+  --interface-cfg config/charmander.yml \
+  --controller-type OSC_POSE \
+  --vendor-id 9583 \
+  --spacemouse-connection wired \
+  --task-name round_table \
+  --draw-part-poses \
+  --prompt-depth-anything \
+  --prompt-depth-model vitl \
+  --prompt-depth-cameras both \
+  --prompt-depth-max-size 448 \
+  --prompt-depth-colormap viridis
+```
+
+front 预览会绘制 `P0 round_table_top`、`P1 round_table_leg` 和
+`P2 round_table_base`。首次按 `b` 前应确认 `valid=111`；数据分别保存到：
+
+```text
+$DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/{success|failure}/
+```
+
+### Lamp 数采（默认配置，可直接复制）
+
+先完成 `--target lamp` 的相机与零件初始位置 setup，再运行下面的命令。相机
+profile、记录频率和 PromptDA 沿用当前默认值：
+
+```shell
+source ~/.bashrc
+conda activate deoxys
+cd /home/hz/code/YueHu_deoxys/deoxys
+
+python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
+  --interface-cfg config/charmander.yml \
+  --controller-type OSC_POSE \
+  --vendor-id 9583 \
+  --spacemouse-connection wired \
+  --task-name lamp \
+  --draw-part-poses \
+  --prompt-depth-anything \
+  --prompt-depth-model vitl \
+  --prompt-depth-cameras both \
+  --prompt-depth-max-size 448 \
+  --prompt-depth-colormap viridis
+```
+
+front 预览会绘制 `P0 lamp_base`、`P1 lamp_bulb` 和 `P2 lamp_hood`。首次按
+`b` 前应确认 `valid=111`；数据分别保存到：
+
+```text
+$DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/{success|failure}/
+```
+
 ### 完整参数命令（与默认配置相同）
 
 需要显式固定每个相机 profile 时，复制下面的完整命令：
@@ -428,16 +491,19 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 ### 按键与保存结果
 
 脚本默认实时显示写入 pickle 前的 wrist/front RGB 拼接画面；推荐命令均添加
-`--draw-part-poses`，在 front 画面上绘制 `P0 tabletop` 和 `P4 movable_leg` 的
-三维坐标轴。坐标轴使用与 front camera setup 相同的 `camera_to_april` 求逆、
+`--draw-part-poses`。`one_leg` 在 front 画面上绘制 `P0 tabletop` 和
+`P4 movable_leg`；`round_table` 绘制 `P0 top`、`P1 leg` 和 `P2 base`；`lamp`
+绘制 `P0 base`、`P1 bulb` 和 `P2 hood` 的三维坐标轴。坐标轴使用与 front camera
+setup 相同的 `camera_to_april` 求逆、
 Rodrigues 和 `cv2.drawFrameAxes` 投影流程。绿色 `FOUND` 表示当前帧成功检测，黄色
 `STALE` 表示暂时使用上一次检测位姿及其 age。配置初始化的 `P1/P2/P3` 和固定障碍物
-`P5` 不会伪装成实时检测结果。
+`P5` 只存在于 `one_leg`，不会伪装成实时检测结果。
 
 按键：`b` 开始、`e` 结束、`s` 保存为成功、`f` 保存为失败、`d` 丢弃、`r` 关节
 复位、`p` 实时开关 part-pose 绘制、`q` 退出。OpenCV 预览窗口获得焦点时这些按键
-同样有效。只有 front 已经得到 tabletop 和可动腿的位姿时才允许开始录制。短暂的
-AprilTag 遮挡会保留最后一次位姿，同时用 `parts_founds`、`parts_pose_valid` 和
+同样有效。`one_leg` 只有得到 tabletop 和可动腿的位姿才允许开始录制；
+`round_table` 和 `lamp` 都要求各自三个零件全部有效。短暂的 AprilTag 遮挡会保留
+最后一次位姿，同时用 `parts_founds`、`parts_pose_valid` 和
 `parts_pose_age_ms` 标记是否为当前帧检测以及位姿新鲜度。
 
 预览和坐标轴只用于屏幕显示，不会写入 pickle RGB 或保存的 MP4。没有图形桌面或
@@ -447,15 +513,17 @@ AprilTag 遮挡会保留最后一次位姿，同时用 `parts_founds`、`parts_p
 原始 episode 保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/one_leg/teleop/low/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/<task-name>/teleop/low/{success|failure}/
 ```
 
 每个 pickle 包含 `N+1` 个 observation、`N` 个 8 维 delta action 和 `N` 个 reward。
 `color_image1`/`depth_image1` 是 wrist，`color_image2`/`depth_image2` 是 front。
 RGB 为 `240x320 uint8`，对齐到 RGB 的 depth 为正米制 `240x320 float16`。
-`parts_poses` 是 FurnitureBench AprilTag 坐标系中的 5 个 one-leg 零件加障碍物，共
-42 个数值。action 格式为 `[dx, dy, dz, dqx, dqy, dqz, dqw, gripper]`：平移单位
-为米，四元数顺序为 `xyzw`，旋转是末端局部坐标系右乘 delta。
+`parts_poses` 使用 FurnitureBench AprilTag 坐标系：`one_leg` 是 5 个零件加障碍物，
+共 42 个数值；`round_table` 按 top、leg、base 顺序，`lamp` 按 base、bulb、hood
+顺序保存 3 个 7 维 pose，共 21 个数值。action 格式为
+`[dx, dy, dz, dqx, dqy, dqz, dqw, gripper]`：平移单位为米，
+四元数顺序为 `xyzw`，旋转是末端局部坐标系右乘 delta。
 
 正式数采默认按 USB 3.x/`5000M` 配置：front RGB-D 为 `1280x720@30`，wrist
 RGB-D 为 `640x480@30`。图像处理没有 `1280x720 -> 640x480 -> 320x240` 这样的

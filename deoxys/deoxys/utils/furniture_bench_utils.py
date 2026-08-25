@@ -286,35 +286,60 @@ def estimate_camera_to_april_frame(color_bgr, intrinsics, detector=None):
     return comp_avg_pose(transforms)
 
 
-class OneLegPoseTracker:
-    """Track the dynamic one-leg parts in the FurnitureBench AprilTag frame."""
+class FurniturePoseTracker:
+    """Track task-specific furniture parts in the FurnitureBench AprilTag frame."""
 
-    def __init__(self, obstacle_pose=None, camera_pose_sample_count=10):
+    SUPPORTED_TASKS = ("one_leg", "round_table", "lamp")
+
+    def __init__(
+        self,
+        task_name="one_leg",
+        obstacle_pose=None,
+        camera_pose_sample_count=10,
+    ):
         from furniture_bench.config import config
         from furniture_bench.furniture import furniture_factory
         from furniture_bench.perception.apriltag import AprilTag
 
+        if task_name not in self.SUPPORTED_TASKS:
+            raise ValueError(
+                f"unsupported furniture task {task_name!r}; "
+                f"expected one of {self.SUPPORTED_TASKS}"
+            )
+        self.task_name = task_name
         self.config = config
-        self.furniture = furniture_factory("one_leg")
+        self.furniture = furniture_factory(task_name)
         self.base_detector = AprilTag(config["furniture"]["base_tag_size"])
         self.detector = AprilTag(self.furniture.tag_size)
-        self.obstacle_pose = np.asarray(
-            DEFAULT_OBSTACLE_POSE if obstacle_pose is None else obstacle_pose,
-            dtype=np.float32,
-        ).reshape(7)
+        self.part_names = tuple(part.name for part in self.furniture.parts)
+        self.tracked_part_indices = (
+            (0, 4)
+            if task_name == "one_leg"
+            else tuple(range(self.furniture.num_parts))
+        )
+        self.required_part_indices = self.tracked_part_indices
+        self.pose_count = self.furniture.num_parts + int(task_name == "one_leg")
+        self.obstacle_pose = None
+        if task_name == "one_leg":
+            self.obstacle_pose = np.asarray(
+                DEFAULT_OBSTACLE_POSE if obstacle_pose is None else obstacle_pose,
+                dtype=np.float32,
+            ).reshape(7)
         self.camera_to_april = None
         self.camera_pose_sample_count = int(camera_pose_sample_count)
         if self.camera_pose_sample_count <= 0:
             raise ValueError("camera_pose_sample_count must be positive")
         self._camera_pose_samples = []
-        self.last_poses = np.zeros((6, 7), dtype=np.float32)
-        self.valid = np.zeros(6, dtype=bool)
-        self.last_seen_ns = np.zeros(6, dtype=np.int64)
+        self.last_poses = np.zeros((self.pose_count, 7), dtype=np.float32)
+        self.valid = np.zeros(self.pose_count, dtype=bool)
+        self.last_seen_ns = np.zeros(self.pose_count, dtype=np.int64)
         self._initialize_configured_poses()
 
     def _initialize_configured_poses(self):
         from furniture_bench.utils import transform as fb_transform
 
+        if self.task_name != "one_leg":
+            return
         for part_index in (1, 2, 3):
             part = self.furniture.parts[part_index]
             position = np.asarray(part.reset_pos[0], dtype=np.float32)
@@ -322,12 +347,13 @@ class OneLegPoseTracker:
             quaternion = fb_transform.mat2quat(orientation[:3, :3])
             self.last_poses[part_index] = np.concatenate([position, quaternion])
             self.valid[part_index] = True
-        self.last_poses[5] = self.obstacle_pose
-        self.valid[5] = True
+        obstacle_index = self.furniture.num_parts
+        self.last_poses[obstacle_index] = self.obstacle_pose
+        self.valid[obstacle_index] = True
 
     @property
     def ready(self):
-        return bool(self.valid[0] and self.valid[4])
+        return bool(np.all(self.valid[list(self.required_part_indices)]))
 
     def update(self, color_bgr, intrinsics):
         from furniture_bench.utils import transform as fb_transform
@@ -346,14 +372,14 @@ class OneLegPoseTracker:
             if len(self._camera_pose_samples) >= self.camera_pose_sample_count:
                 self.camera_to_april = comp_avg_pose(self._camera_pose_samples)
 
-        found = np.zeros(6, dtype=bool)
+        found = np.zeros(self.pose_count, dtype=bool)
         if self.camera_to_april is not None:
             color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
             tags = self.detector.detect_id(
                 color_rgb,
                 camera_intrinsics_vector(intrinsics),
             )
-            for part_index in (0, 4):
+            for part_index in self.tracked_part_indices:
                 pose_in_camera = _get_parts_pose(
                     self.furniture.parts[part_index],
                     tags,
@@ -369,8 +395,8 @@ class OneLegPoseTracker:
                 self.last_seen_ns[part_index] = now_ns
                 found[part_index] = True
 
-        age_ms = np.zeros(6, dtype=np.float32)
-        for part_index in (0, 4):
+        age_ms = np.zeros(self.pose_count, dtype=np.float32)
+        for part_index in self.tracked_part_indices:
             if not self.valid[part_index]:
                 age_ms[part_index] = np.inf
             else:
@@ -393,8 +419,19 @@ class OneLegPoseTracker:
         }
 
 
+class OneLegPoseTracker(FurniturePoseTracker):
+    """Backward-compatible one-leg tracker used by the setup diagnostics."""
+
+    def __init__(self, obstacle_pose=None, camera_pose_sample_count=10):
+        super().__init__(
+            task_name="one_leg",
+            obstacle_pose=obstacle_pose,
+            camera_pose_sample_count=camera_pose_sample_count,
+        )
+
+
 class DualRealSenseSnapshotter:
-    """Continuously capture front/wrist RGB-D and optional one-leg state."""
+    """Continuously capture front/wrist RGB-D and task-specific part state."""
 
     def __init__(
         self,
@@ -405,7 +442,7 @@ class DualRealSenseSnapshotter:
         fps=30,
         record_width=320,
         record_height=240,
-        track_one_leg=True,
+        furniture_task="one_leg",
         obstacle_pose=None,
         front_width=None,
         front_height=None,
@@ -457,7 +494,11 @@ class DualRealSenseSnapshotter:
             wrist_height,
             *self.record_size,
         )
-        self.tracker = OneLegPoseTracker(obstacle_pose) if track_one_leg else None
+        self.tracker = (
+            FurniturePoseTracker(furniture_task, obstacle_pose)
+            if furniture_task is not None
+            else None
+        )
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread = None

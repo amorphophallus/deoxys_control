@@ -15,6 +15,7 @@ from deoxys.utils.furniture_bench_utils import (
     OneLegPoseTracker,
     RealSenseCamera,
     camera_intrinsics_matrix,
+    camera_intrinsics_vector,
     connected_realsense_devices,
     estimate_camera_to_april_frame,
 )
@@ -113,8 +114,137 @@ def add_error_line(image, label, value, threshold, row):
     )
 
 
+def draw_furniture_reset_poses(
+    image,
+    furniture,
+    camera_to_april,
+    intrinsics,
+    detected_tags,
+):
+    """Draw FurnitureBench part reset poses in the live front-camera image."""
+    from furniture_bench.utils.detection import _get_parts_pose
+
+    april_to_camera = np.linalg.inv(camera_to_april)
+    camera_matrix = camera_intrinsics_matrix(intrinsics)
+    distortion = np.zeros(5)
+
+    for part in furniture.parts:
+        reset_pose = np.eye(4, dtype=np.float64)
+        reset_pose[:3, :3] = np.asarray(part.reset_ori[0], dtype=np.float64)[
+            :3, :3
+        ]
+        reset_pose[:3, 3] = np.asarray(part.reset_pos[0], dtype=np.float64)
+        pose_in_camera = april_to_camera @ reset_pose
+        if pose_in_camera[2, 3] <= 0.0:
+            continue
+
+        rotation_vector, _ = cv2.Rodrigues(pose_in_camera[:3, :3])
+        translation = pose_in_camera[:3, 3]
+        cv2.drawFrameAxes(
+            image,
+            camera_matrix,
+            distortion,
+            rotation_vector,
+            translation,
+            0.04,
+            3,
+        )
+        projected, _ = cv2.projectPoints(
+            np.zeros((1, 3), dtype=np.float32),
+            rotation_vector,
+            translation,
+            camera_matrix,
+            distortion,
+        )
+        x, y = np.rint(projected[0, 0]).astype(int)
+        label = f"TARGET {part.part_idx}: {part.name}"
+        cv2.putText(
+            image,
+            label,
+            (x + 8, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            label,
+            (x + 8, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        current_pose = _get_parts_pose(part, detected_tags)
+        if current_pose is None:
+            continue
+        current_rotation, _ = cv2.Rodrigues(current_pose[:3, :3])
+        current_translation = current_pose[:3, 3]
+        cv2.drawFrameAxes(
+            image,
+            camera_matrix,
+            distortion,
+            current_rotation,
+            current_translation,
+            0.04,
+            2,
+        )
+        current_projected, _ = cv2.projectPoints(
+            np.zeros((1, 3), dtype=np.float32),
+            current_rotation,
+            current_translation,
+            camera_matrix,
+            distortion,
+        )
+        current_x, current_y = np.rint(current_projected[0, 0]).astype(int)
+        cv2.line(
+            image,
+            (current_x, current_y),
+            (x, y),
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            f"CURRENT {part.part_idx}",
+            (current_x + 8, current_y + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        image,
+        "Align CURRENT axes with the labeled TARGET axes",
+        (25, image.shape[0] - 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        "Align CURRENT axes with the labeled TARGET axes",
+        (25, image.shape[0] - 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def run_calibration(args):
     from furniture_bench.config import config
+    from furniture_bench.furniture import furniture_factory
     from furniture_bench.perception.apriltag import AprilTag
     from furniture_bench.scripts.calibration import ASSET_ROOT, avg_pose
     from furniture_bench.utils.pose import mat_to_roll_pitch_yaw
@@ -139,6 +269,12 @@ def run_calibration(args):
     target_pose = np.asarray(avg_pose[args.target], dtype=np.float64)
     target_rpy = np.asarray(mat_to_roll_pitch_yaw(target_pose[:3, :3]))
     base_detector = AprilTag(config["furniture"]["base_tag_size"])
+    furniture = (
+        furniture_factory(args.target)
+        if args.target in ("round_table", "lamp")
+        else None
+    )
+    part_detector = AprilTag(furniture.tag_size) if furniture is not None else None
     print("Calibration started. Press q or Esc in the window to quit.")
     try:
         while True:
@@ -212,6 +348,18 @@ def run_calibration(args):
                     0.05,
                     4,
                 )
+                if furniture is not None:
+                    detected_tags = part_detector.detect_id(
+                        cv2.cvtColor(color, cv2.COLOR_BGR2RGB),
+                        camera_intrinsics_vector(camera.intrinsics),
+                    )
+                    draw_furniture_reset_poses(
+                        view,
+                        furniture,
+                        camera_to_april,
+                        camera.intrinsics,
+                        detected_tags,
+                    )
 
             cv2.imshow("FurnitureBench front-camera calibration", view)
             key = cv2.waitKey(1) & 0xFF
@@ -370,7 +518,7 @@ def parse_args():
     add_interface(calibrate)
     calibrate.add_argument(
         "--target",
-        choices=("setup_front", "obstacle", "one_leg"),
+        choices=("setup_front", "obstacle", "one_leg", "round_table", "lamp"),
         required=True,
     )
     calibrate.add_argument("--position-threshold", type=float, default=0.004)

@@ -6,12 +6,47 @@ import numpy as np
 
 from deoxys.utils import transform_utils
 from deoxys.utils.furniture_bench_utils import (
+    FurniturePoseTracker,
     WRIST_TO_TIP,
     center_crop_resize,
     center_crop_resize_geometry,
     deoxys_delta_to_furniture_bench_action,
     transformed_intrinsics,
 )
+
+
+class FurniturePoseTrackerTest(unittest.TestCase):
+    def test_one_leg_keeps_existing_six_pose_layout(self):
+        tracker = FurniturePoseTracker("one_leg")
+
+        self.assertEqual(tracker.last_poses.shape, (6, 7))
+        self.assertEqual(tracker.tracked_part_indices, (0, 4))
+        np.testing.assert_array_equal(
+            tracker.valid,
+            np.array([False, True, True, True, False, True]),
+        )
+
+    def test_round_table_tracks_all_three_parts(self):
+        tracker = FurniturePoseTracker("round_table")
+
+        self.assertEqual(tracker.last_poses.shape, (3, 7))
+        self.assertEqual(tracker.tracked_part_indices, (0, 1, 2))
+        self.assertEqual(
+            tracker.part_names,
+            ("round_table_top", "round_table_leg", "round_table_base"),
+        )
+        np.testing.assert_array_equal(tracker.valid, np.zeros(3, dtype=bool))
+
+    def test_lamp_tracks_all_three_parts(self):
+        tracker = FurniturePoseTracker("lamp")
+
+        self.assertEqual(tracker.last_poses.shape, (3, 7))
+        self.assertEqual(tracker.tracked_part_indices, (0, 1, 2))
+        self.assertEqual(
+            tracker.part_names,
+            ("lamp_base", "lamp_bulb", "lamp_hood"),
+        )
+        np.testing.assert_array_equal(tracker.valid, np.zeros(3, dtype=bool))
 
 
 class FurnitureBenchActionTest(unittest.TestCase):

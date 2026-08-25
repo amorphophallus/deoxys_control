@@ -63,7 +63,19 @@ RESET_JOINT_POSITIONS = [
 ]
 
 PREVIEW_WINDOW_NAME = "FurnitureBench SpaceMouse data collection"
-LIVE_PART_NAMES = {0: "tabletop", 4: "movable_leg"}
+TASK_PART_NAMES = {
+    "one_leg": {0: "tabletop", 4: "movable_leg"},
+    "round_table": {
+        0: "round_table_top",
+        1: "round_table_leg",
+        2: "round_table_base",
+    },
+    "lamp": {
+        0: "lamp_base",
+        1: "lamp_bulb",
+        2: "lamp_hood",
+    },
+}
 PROMPT_DEPTH_FIELDS = {
     "wrist": "depth_image1",
     "front": "depth_image2",
@@ -222,9 +234,12 @@ def _draw_front_part_poses(
     front_bgr,
     camera_sample,
     record_intrinsics,
+    part_names=None,
     axis_length=0.035,
 ):
-    """Draw live P0/P4 poses without modifying the recorded RGB image."""
+    """Draw task-specific part poses without modifying the recorded RGB image."""
+    if part_names is None:
+        part_names = TASK_PART_NAMES["one_leg"]
     preview = front_bgr.copy()
     camera_to_april = camera_sample.get("camera_to_april")
     parts_poses = camera_sample.get("parts_poses")
@@ -256,7 +271,7 @@ def _draw_front_part_poses(
     intrinsics_matrix = _record_intrinsics_matrix(record_intrinsics)
     distortion = np.zeros(5, dtype=np.float64)
 
-    for part_index, part_name in LIVE_PART_NAMES.items():
+    for part_index, part_name in part_names.items():
         if part_index >= len(valid) or not valid[part_index]:
             continue
         pose = parts_poses[part_index]
@@ -317,6 +332,7 @@ def _build_camera_preview(
     camera_info,
     episode_state,
     draw_part_poses,
+    task_name="one_leg",
     prompt_depth_result=None,
     depth_min_m=0.05,
     depth_max_m=3.0,
@@ -334,6 +350,7 @@ def _build_camera_preview(
             front,
             camera_sample,
             camera_info["front"]["record_intrinsics"],
+            part_names=TASK_PART_NAMES[task_name],
         )
 
     valid = np.asarray(
@@ -563,12 +580,18 @@ class RawEpisodeRecorder:
         self.last_recorded_gripper = None
         self.gripper_hold_remaining = 0
 
-    @staticmethod
-    def _parts_ready(observation):
+    def _parts_ready(self, observation):
         if observation is None:
             return False
         valid = observation.get("parts_pose_valid")
-        return valid is not None and bool(valid[0] and valid[4])
+        if valid is None:
+            return False
+        valid = np.asarray(valid, dtype=bool).reshape(-1)
+        required_indices = TASK_PART_NAMES[self.task_name]
+        return all(
+            part_index < len(valid) and bool(valid[part_index])
+            for part_index in required_indices
+        )
 
     def begin(self, initial_observation):
         if self.state == "recording":
@@ -578,9 +601,10 @@ class RawEpisodeRecorder:
             logger.warning("Save or discard the previous episode first")
             return False
         if not self._parts_ready(initial_observation):
+            required_parts = ", ".join(TASK_PART_NAMES[self.task_name].values())
             logger.warning(
-                "Recording not started: tabletop and movable-leg poses have not "
-                "both been detected"
+                "Recording not started: required %s poses have not all been detected",
+                required_parts,
             )
             return False
         self.observations = [initial_observation]
@@ -770,7 +794,11 @@ def parse_args():
         help="override the product ID selected by --spacemouse-connection",
     )
     parser.add_argument("--data-root", default=default_data_root)
-    parser.add_argument("--task-name", choices=("one_leg",), default="one_leg")
+    parser.add_argument(
+        "--task-name",
+        choices=tuple(TASK_PART_NAMES),
+        default="one_leg",
+    )
     parser.add_argument("--randomness", choices=("low",), default="low")
     parser.add_argument(
         "--front-camera-serial",
@@ -864,7 +892,7 @@ def main():
             wrist_serial=args.wrist_camera_serial,
             record_width=args.record_image_width,
             record_height=args.record_image_height,
-            track_one_leg=True,
+            furniture_task=args.task_name,
             front_width=args.front_color_width,
             front_height=args.front_color_height,
             front_fps=args.front_color_fps,
@@ -969,6 +997,7 @@ def main():
                         camera_info,
                         episode.state,
                         draw_part_poses,
+                        task_name=args.task_name,
                         prompt_depth_result=prompt_result,
                         depth_min_m=args.prompt_depth_min_m,
                         depth_max_m=args.prompt_depth_display_max_m,
