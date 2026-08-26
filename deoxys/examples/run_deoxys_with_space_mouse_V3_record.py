@@ -84,6 +84,41 @@ SPACEMOUSE_PRODUCT_IDS = {
     "wireless": 50770,  # 0xc652 Universal Receiver
     "wired": 50746,  # 0xc63a wired connection
 }
+REAL_ANNOTATION_SOURCE = "real_skill_annotation_util"
+REAL_ANNOTATION_OUTPUT_FIELDS = (
+    "skill_state",
+    "assembly_step",
+    "guidance_point",
+    "guidance_point_clean",
+    "guidance_pose",
+    "guidance_pose_clean",
+    "guidance_gripper_width",
+    "guidance_point_2d",
+    "grasp_annotation_2d",
+    "real_annotation_debug",
+)
+RAW_EPISODE_GLOB = "????-??-??T??-??-??.??????.pkl"
+
+
+def _create_real_skill_annotation_session(task_name, camera_info):
+    try:
+        from src.eval.real_skill_annotation_util import (
+            RealSkillAnnotationSession,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Could not import robust-rearrangement real annotation util. "
+            "Run `source ~/.bashrc` and make sure "
+            "/home/hz/code/robust-rearrangement-custom is on PYTHONPATH."
+        ) from exc
+    return RealSkillAnnotationSession(task_name, camera_info, mode="online")
+
+
+def _clear_real_skill_annotation(observation):
+    observation["skill"] = None
+    observation["guidance"] = None
+    for key in REAL_ANNOTATION_OUTPUT_FIELDS:
+        observation.pop(key, None)
 
 
 class NonBlockingKeyReader:
@@ -327,12 +362,67 @@ def _draw_front_part_poses(
     return preview
 
 
+def _draw_real_skill_annotation(front_bgr, observation):
+    """Draw the live guidance point and skill without mutating recorded RGB."""
+    preview = front_bgr.copy()
+    if not observation:
+        return preview
+
+    point = None
+    projections = observation.get("guidance_point_2d")
+    if isinstance(projections, dict):
+        point = projections.get("color_image2")
+    if point is not None:
+        point = np.asarray(point, dtype=np.float64).reshape(-1)
+        if point.size == 2 and np.all(np.isfinite(point)):
+            source = observation.get("color_image2")
+            source_height, source_width = preview.shape[:2]
+            if isinstance(source, np.ndarray) and source.ndim >= 2:
+                source_height, source_width = source.shape[:2]
+            x = int(round(point[0] * preview.shape[1] / source_width))
+            y = int(round(point[1] * preview.shape[0] / source_height))
+            if 0 <= x < preview.shape[1] and 0 <= y < preview.shape[0]:
+                cv2.drawMarker(
+                    preview,
+                    (x, y),
+                    (255, 0, 255),
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=18,
+                    thickness=2,
+                    line_type=cv2.LINE_AA,
+                )
+                cv2.circle(preview, (x, y), 8, (255, 255, 255), 2, cv2.LINE_AA)
+
+    skill = observation.get("skill")
+    skill_state = observation.get("skill_state")
+    if isinstance(skill, bytes):
+        skill = skill.decode("utf-8")
+    if isinstance(skill_state, bytes):
+        skill_state = skill_state.decode("utf-8")
+    if skill is not None:
+        label = f"annotation={skill}"
+        if skill_state is not None:
+            label += f"/{skill_state}"
+        cv2.putText(
+            preview,
+            label,
+            (8, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return preview
+
+
 def _build_camera_preview(
     camera_sample,
     camera_info,
     episode_state,
     draw_part_poses,
     task_name="one_leg",
+    annotation_observation=None,
     prompt_depth_result=None,
     depth_min_m=0.05,
     depth_max_m=3.0,
@@ -352,6 +442,7 @@ def _build_camera_preview(
             camera_info["front"]["record_intrinsics"],
             part_names=TASK_PART_NAMES[task_name],
         )
+    front = _draw_real_skill_annotation(front, annotation_observation)
 
     valid = np.asarray(
         camera_sample.get("parts_pose_valid", np.zeros(6, dtype=bool)),
@@ -522,6 +613,18 @@ def _write_episode(output_path, payload, video_fps, save_video):
     return output_path
 
 
+def _raw_episode_counts(outcomes_root):
+    outcomes_root = Path(outcomes_root)
+    return tuple(
+        sum(
+            1
+            for path in (outcomes_root / outcome).glob(RAW_EPISODE_GLOB)
+            if path.is_file()
+        )
+        for outcome in ("success", "failure")
+    )
+
+
 class EpisodeWriter:
     def __init__(self, video_fps=10, save_video=True):
         self.video_fps = int(video_fps)
@@ -546,7 +649,16 @@ class EpisodeWriter:
     @staticmethod
     def _report_result(future):
         try:
-            logger.info("Saved raw episode to %s", future.result())
+            output_path = future.result()
+            success_count, failure_count = _raw_episode_counts(
+                output_path.parent.parent
+            )
+            logger.info(
+                "Saved raw episode to %s; files: success=%d fail=%d",
+                output_path,
+                success_count,
+                failure_count,
+            )
         except Exception:
             logger.exception("Episode writer failed")
 
@@ -565,6 +677,7 @@ class RawEpisodeRecorder:
         camera_info,
         writer,
         prompt_depth_config=None,
+        annotation_session_factory=None,
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
@@ -572,6 +685,9 @@ class RawEpisodeRecorder:
         self.camera_info = camera_info
         self.writer = writer
         self.prompt_depth_config = prompt_depth_config
+        self.annotation_session_factory = annotation_session_factory
+        self.annotation_session = None
+        self.annotation_error = None
         self.observations = []
         self.actions = []
         self.started_at = None
@@ -607,12 +723,26 @@ class RawEpisodeRecorder:
                 required_parts,
             )
             return False
+        annotation_session = None
+        if self.annotation_session_factory is not None:
+            try:
+                annotation_session = self.annotation_session_factory(
+                    self.task_name, self.camera_info
+                )
+                annotation_session.annotate_observation(initial_observation)
+            except Exception:
+                logger.exception(
+                    "Recording not started: real-time skill annotation failed"
+                )
+                return False
         self.observations = [initial_observation]
         self.actions = []
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
         self.last_recorded_gripper = None
         self.gripper_hold_remaining = 0
+        self.annotation_session = annotation_session
+        self.annotation_error = None
         self.state = "recording"
         logger.info("Recording started")
         return True
@@ -632,6 +762,7 @@ class RawEpisodeRecorder:
         if self.state != "recording" or observation is None:
             return
         if len(self.observations) == len(self.actions):
+            self._annotate_observation(observation)
             self.observations.append(observation)
         if len(self.observations) != len(self.actions) + 1:
             raise RuntimeError("invalid observation/action alignment")
@@ -649,6 +780,7 @@ class RawEpisodeRecorder:
             if final_observation is None:
                 logger.warning("Waiting for a terminal observation before stopping")
                 return
+            self._annotate_observation(final_observation)
             self.observations.append(final_observation)
         self.stopped_at = datetime.now().isoformat(timespec="milliseconds")
         self.state = "pending_save"
@@ -710,6 +842,17 @@ class RawEpisodeRecorder:
                 "prompt_depth_anything": self.prompt_depth_config,
             },
         }
+        if self.annotation_session is not None:
+            self.annotation_session.update_trajectory_metadata(payload)
+        elif self.annotation_session_factory is not None:
+            for observation in payload["observations"]:
+                _clear_real_skill_annotation(observation)
+            payload["metadata"]["real_skill_annotation"] = {
+                "source": REAL_ANNOTATION_SOURCE,
+                "mode": "online",
+                "complete": False,
+                "error": self.annotation_error,
+            }
         self.writer.submit(output_path, payload)
         self.discard(log=False)
         return output_path
@@ -723,8 +866,23 @@ class RawEpisodeRecorder:
         self.state = "idle"
         self.last_recorded_gripper = None
         self.gripper_hold_remaining = 0
+        self.annotation_session = None
+        self.annotation_error = None
         if log:
             logger.info("Discarded episode with %d actions", action_count)
+
+    def _annotate_observation(self, observation):
+        if self.annotation_session is None:
+            return
+        try:
+            self.annotation_session.annotate_observation(observation)
+        except Exception as exc:
+            self.annotation_error = f"{type(exc).__name__}: {exc}"
+            self.annotation_session = None
+            logger.exception(
+                "Real-time annotation failed; the raw episode will remain savable "
+                "and can be annotated offline"
+            )
 
 
 def wait_for_robot_state(robot_interface, timeout=5.0):
@@ -830,6 +988,14 @@ def parse_args():
     parser.add_argument("--gripper-hold-frames", type=int, default=8)
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--draw-part-poses", action="store_true")
+    parser.add_argument(
+        "--real-skill-annotation",
+        action="store_true",
+        help=(
+            "run the robust-rearrangement one_leg annotator online, draw its "
+            "skill/guidance point, and save annotations in the pickle"
+        ),
+    )
     parser.add_argument("--no-camera-preview", action="store_true")
     parser.add_argument(
         "--prompt-depth-anything",
@@ -869,6 +1035,10 @@ def parse_args():
         parser.error("--data-root is required when DATA_DIR_RAW is not set")
     if args.record_fps <= 0:
         parser.error("--record-fps must be greater than zero")
+    if args.real_skill_annotation and args.task_name != "one_leg":
+        parser.error(
+            "--real-skill-annotation currently supports only --task-name one_leg"
+        )
     return args
 
 
@@ -878,6 +1048,11 @@ def main():
     prompt_depth_worker = None
     prompt_depth_cameras = ()
     prompt_depth_config = None
+    annotation_session_factory = None
+    preview_annotation_session = None
+    preview_annotation_error = None
+    preview_annotation_capture_ns = None
+    last_annotation_observation = None
     episode = None
     writer = EpisodeWriter(
         video_fps=args.record_fps,
@@ -908,6 +1083,12 @@ def main():
         )
         camera.start()
         camera_info = camera.metadata()
+        if args.real_skill_annotation:
+            annotation_session_factory = _create_real_skill_annotation_session
+            if not args.no_camera_preview:
+                preview_annotation_session = annotation_session_factory(
+                    args.task_name, camera_info
+                )
         if args.prompt_depth_anything:
             prompt_depth_cameras = (
                 ("wrist", "front")
@@ -943,6 +1124,7 @@ def main():
             camera_info=camera_info,
             writer=writer,
             prompt_depth_config=prompt_depth_config,
+            annotation_session_factory=annotation_session_factory,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
@@ -987,6 +1169,37 @@ def main():
                     robot_interface,
                     observation_camera_sample,
                 )
+                annotation_observation = None
+                if (
+                    args.real_skill_annotation
+                    and not args.no_camera_preview
+                    and observation is not None
+                ):
+                    capture_ns = observation.get("camera_capture_wall_time_ns")
+                    if (
+                        capture_ns is None
+                        or capture_ns != preview_annotation_capture_ns
+                    ):
+                        if preview_annotation_session is None:
+                            preview_annotation_session = annotation_session_factory(
+                                args.task_name, camera_info
+                            )
+                        try:
+                            preview_annotation_session.annotate_observation(observation)
+                            last_annotation_observation = observation
+                            preview_annotation_capture_ns = capture_ns
+                            preview_annotation_error = None
+                        except Exception as exc:
+                            message = f"{type(exc).__name__}: {exc}"
+                            if message != preview_annotation_error:
+                                logger.warning(
+                                    "Live annotation is waiting for usable poses: %s",
+                                    message,
+                                )
+                                preview_annotation_error = message
+                            preview_annotation_session = None
+                            last_annotation_observation = None
+                    annotation_observation = last_annotation_observation
                 keys = key_reader.read_keys()
                 if not args.no_camera_preview:
                     preview_sample = camera_sample
@@ -998,6 +1211,7 @@ def main():
                         episode.state,
                         draw_part_poses,
                         task_name=args.task_name,
+                        annotation_observation=annotation_observation,
                         prompt_depth_result=prompt_result,
                         depth_min_m=args.prompt_depth_min_m,
                         depth_max_m=args.prompt_depth_display_max_m,
@@ -1011,15 +1225,51 @@ def main():
                 for key in keys:
                     if key == "b":
                         if episode.begin(observation):
+                            if (
+                                annotation_session_factory is not None
+                                and not args.no_camera_preview
+                            ):
+                                preview_annotation_session = annotation_session_factory(
+                                    args.task_name, camera_info
+                                )
+                                preview_annotation_capture_ns = None
+                                last_annotation_observation = None
                             next_record_time = time.monotonic()
                     elif key == "e":
                         episode.stop(observation)
                     elif key == "s":
                         episode.save(success=True)
+                        if (
+                            annotation_session_factory is not None
+                            and not args.no_camera_preview
+                        ):
+                            preview_annotation_session = annotation_session_factory(
+                                args.task_name, camera_info
+                            )
+                            preview_annotation_capture_ns = None
+                            last_annotation_observation = None
                     elif key == "f":
                         episode.save(success=False)
+                        if (
+                            annotation_session_factory is not None
+                            and not args.no_camera_preview
+                        ):
+                            preview_annotation_session = annotation_session_factory(
+                                args.task_name, camera_info
+                            )
+                            preview_annotation_capture_ns = None
+                            last_annotation_observation = None
                     elif key == "d":
                         episode.discard()
+                        if (
+                            annotation_session_factory is not None
+                            and not args.no_camera_preview
+                        ):
+                            preview_annotation_session = annotation_session_factory(
+                                args.task_name, camera_info
+                            )
+                            preview_annotation_capture_ns = None
+                            last_annotation_observation = None
                     elif key == "p":
                         draw_part_poses = not draw_part_poses
                         logger.info(

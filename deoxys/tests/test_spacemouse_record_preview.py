@@ -1,6 +1,8 @@
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -13,6 +15,8 @@ from examples.run_deoxys_with_space_mouse_V3_record import (
     _build_camera_preview,
     _camera_sample_with_prompt_depth,
     _draw_front_part_poses,
+    _draw_real_skill_annotation,
+    _raw_episode_counts,
     parse_args,
 )
 
@@ -83,6 +87,17 @@ class SpaceMouseConnectionTest(unittest.TestCase):
 
         self.assertEqual(args.task_name, "lamp")
 
+    def test_real_skill_annotation_is_explicit_and_one_leg_only(self):
+        args = self.parse("--real-skill-annotation")
+
+        self.assertTrue(args.real_skill_annotation)
+        with self.assertRaises(SystemExit):
+            self.parse(
+                "--task-name",
+                "round_table",
+                "--real-skill-annotation",
+            )
+
     def test_close_stops_listener_and_closes_hid_device(self):
         hid_device = MagicMock()
         hid_device.read.return_value = []
@@ -101,6 +116,141 @@ class SpaceMouseConnectionTest(unittest.TestCase):
 
 
 class PartPosePreviewTest(unittest.TestCase):
+    def test_raw_episode_counts_ignore_derived_and_temporary_pickles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            success = root / "success"
+            failure = root / "failure"
+            success.mkdir()
+            failure.mkdir()
+            for name in (
+                "2026-08-26T10-00-00.000001.pkl",
+                "2026-08-26T10-01-00.000002.pkl",
+            ):
+                (success / name).touch()
+            (failure / "2026-08-26T10-02-00.000003.pkl").touch()
+            (success / "demo.annotated.pkl").touch()
+            (success / "2026-08-26T10-03-00.000004.pkl.tmp").touch()
+
+            self.assertEqual(_raw_episode_counts(root), (2, 1))
+
+    def test_online_annotation_is_saved_with_episode_metadata(self):
+        class CapturingWriter:
+            def __init__(self):
+                self.payload = None
+
+            def submit(self, output_path, payload):
+                self.payload = payload
+
+        class FakeAnnotationSession:
+            def __init__(self):
+                self.frame_idx = 0
+
+            def annotate_observation(self, observation):
+                observation["skill"] = "pick"
+                observation["skill_state"] = "reach"
+                observation["guidance_point_2d"] = {
+                    "color_image1": None,
+                    "color_image2": np.array([160.0, 120.0]),
+                }
+                self.frame_idx += 1
+
+            def update_trajectory_metadata(self, payload):
+                payload["annotation_source"] = "real_skill_annotation_util"
+                payload["metadata"]["real_skill_annotation"] = {
+                    "mode": "online",
+                    "complete": True,
+                    "stats": {"frame_count": self.frame_idx},
+                }
+
+        sessions = []
+
+        def session_factory(task_name, camera_info):
+            self.assertEqual(task_name, "one_leg")
+            session = FakeAnnotationSession()
+            sessions.append(session)
+            return session
+
+        writer = CapturingWriter()
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/real-annotation-test",
+            task_name="one_leg",
+            randomness="low",
+            camera_info={},
+            writer=writer,
+            annotation_session_factory=session_factory,
+        )
+        initial = camera_sample()
+        initial["parts_pose_valid"][4] = True
+        final = camera_sample()
+        final["parts_pose_valid"][4] = True
+
+        self.assertTrue(recorder.begin(initial))
+        recorder.append(initial, np.zeros(8, dtype=np.float32))
+        recorder.stop(final)
+        recorder.save(success=True)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(
+            writer.payload["annotation_source"], "real_skill_annotation_util"
+        )
+        self.assertTrue(
+            writer.payload["metadata"]["real_skill_annotation"]["complete"]
+        )
+        self.assertEqual(
+            writer.payload["metadata"]["real_skill_annotation"]["stats"][
+                "frame_count"
+            ],
+            2,
+        )
+        self.assertEqual(writer.payload["observations"][0]["skill"], "pick")
+
+    def test_annotation_failure_saves_clean_raw_observations(self):
+        class CapturingWriter:
+            def submit(self, output_path, payload):
+                self.payload = payload
+
+        class FailingAnnotationSession:
+            def __init__(self):
+                self.calls = 0
+
+            def annotate_observation(self, observation):
+                self.calls += 1
+                observation["skill"] = "pick"
+                observation["skill_state"] = "reach"
+                if self.calls == 2:
+                    raise ValueError("test failure")
+
+        writer = CapturingWriter()
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/real-annotation-failure-test",
+            task_name="one_leg",
+            randomness="low",
+            camera_info={},
+            writer=writer,
+            annotation_session_factory=lambda task_name, camera_info: (
+                FailingAnnotationSession()
+            ),
+        )
+        initial = camera_sample()
+        initial["parts_pose_valid"][4] = True
+        final = camera_sample()
+        final["parts_pose_valid"][4] = True
+
+        self.assertTrue(recorder.begin(initial))
+        recorder.append(initial, np.zeros(8, dtype=np.float32))
+        recorder.stop(final)
+        recorder.save(success=True)
+
+        metadata = writer.payload["metadata"]["real_skill_annotation"]
+        self.assertFalse(metadata["complete"])
+        self.assertIn("test failure", metadata["error"])
+        self.assertNotIn("annotation_source", writer.payload)
+        for observation in writer.payload["observations"]:
+            self.assertIsNone(observation["skill"])
+            self.assertIsNone(observation["guidance"])
+            self.assertNotIn("skill_state", observation)
+
     def test_round_table_requires_all_three_part_poses(self):
         recorder = RawEpisodeRecorder(
             data_root="/tmp/round-table-test",
@@ -266,6 +416,21 @@ class PartPosePreviewTest(unittest.TestCase):
         np.testing.assert_array_equal(front, original)
         self.assertTrue(np.any(rendered != 0))
         self.assertTrue(np.any(rendered[110:131, 150:171] != 0))
+
+    def test_draws_real_skill_guidance_without_mutating_input(self):
+        front = np.zeros((240, 320, 3), dtype=np.uint8)
+        observation = camera_sample()
+        observation["skill"] = "pick"
+        observation["skill_state"] = "reach"
+        observation["guidance_point_2d"] = {
+            "color_image1": None,
+            "color_image2": np.array([160.0, 120.0]),
+        }
+
+        rendered = _draw_real_skill_annotation(front, observation)
+
+        np.testing.assert_array_equal(front, np.zeros_like(front))
+        self.assertTrue(np.any(rendered[108:133, 148:173] != 0))
 
     def test_skips_part_pose_behind_camera(self):
         sample = camera_sample(part_z=-1.0)

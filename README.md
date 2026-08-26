@@ -170,12 +170,13 @@ pip install "$FURNITURE_BENCH/wheels/dt_apriltags-3.2.0-py3-none-manylinux2010_x
 
 ## 每次开始 setup 前：进入环境
 
-每打开一个新终端，先复制执行：
+下面所有 FrankaControl 命令都从 `YueHu_deoxys` 仓库根目录执行。每打开一个新终端，
+先复制执行：
 
 ```shell
 source ~/.bashrc
 conda activate deoxys
-cd /home/hz/code/YueHu_deoxys/deoxys
+cd /home/hz/code/YueHu_deoxys
 ```
 
 ## 第 0 步：检查两台 RealSense
@@ -214,6 +215,7 @@ wrist-only 命令可用于单相机排查。
 
 ```shell
 python -m deoxys.examples.furniture_bench_setup_deoxys calibrate \
+  --interface-cfg deoxys/config/charmander.yml \
   --target setup_front
 ```
 
@@ -250,6 +252,7 @@ front camera；否则透明参考图不再对应真实视角。
 
 ```shell
 python -m deoxys.examples.furniture_bench_setup_deoxys calibrate \
+  --interface-cfg deoxys/config/charmander.yml \
   --target obstacle
 ```
 
@@ -262,6 +265,7 @@ python -m deoxys.examples.furniture_bench_setup_deoxys calibrate \
 
 ```shell
 python -m deoxys.examples.furniture_bench_setup_deoxys calibrate \
+  --interface-cfg deoxys/config/charmander.yml \
   --target one_leg
 ```
 
@@ -321,6 +325,45 @@ python -m deoxys.examples.furniture_bench_setup_deoxys test-wrist
 
 ### 数采前检查
 
+#### 第 0 步：打开 Franka Desk 并启动 NUC server
+
+FrankaControl 和机械臂控制柜保持连接到 `172.16.0.0/24` 有线控制网。在
+FrankaControl 的浏览器打开 Franka Desk：
+
+```text
+https://172.16.0.2
+```
+
+首次访问可能出现自签名证书警告，确认地址为 `172.16.0.2` 后继续访问。登录 Desk，
+解除急停并解锁关节，然后激活 FCI。Desk 只能从能到达机器人控制网的机器访问，
+Tailscale/ZeroTier 地址不能代替这里的 `172.16.0.2`。
+
+常规数采在 NUC 的两个独立终端分别启动 arm 和 gripper 自动重启脚本：
+
+```shell
+# NUC 终端 1：arm server
+cd /home/mingyu/code/deoxys_control/deoxys
+bash run2.sh
+```
+
+```shell
+# NUC 终端 2：gripper server
+cd /home/mingyu/code/deoxys_control/deoxys
+bash run3.sh
+```
+
+`run2.sh` 调用 `auto_scripts/auto_arm.sh`，`run3.sh` 调用
+`auto_scripts/auto_gripper.sh`。`run1.sh` 是不带自动重启的单次 arm server，只在排查
+arm 退出原因时临时使用；不要同时运行 `run1.sh` 和 `run2.sh`。正常数采固定使用
+`run2.sh + run3.sh`。可在 NUC 的第三个终端检查：
+
+```shell
+pgrep -af 'franka-interface|gripper-interface'
+```
+
+确认两个进程都存在且没有反复退出重启后，再到 FrankaControl 启动下面的 SpaceMouse
+数采程序。
+
 每次调整或重新插拔 front camera 后，必须先重新执行第 4 步，并在全新进程中达到
 `valid` 全 1、`base=10/10`。数采脚本启动时会重新估计外参，因此不要复用调整相机
 之前已经启动的数采进程。相机位置一旦改变，正在录制或尚未保存的 episode 必须
@@ -331,7 +374,7 @@ python -m deoxys.examples.furniture_bench_setup_deoxys test-wrist
 ```shell
 source ~/.bashrc
 conda activate deoxys
-cd /home/hz/code/YueHu_deoxys/deoxys
+cd /home/hz/code/YueHu_deoxys
 df -h "$DATA_DIR_RAW"
 rs-enumerate-devices | grep -E '327122071654|001622071252'
 lsusb -d 256f:
@@ -344,8 +387,8 @@ ID `50770`）；有线连接使用 `256f:c63a`（十进制 product ID `50746`）
 任一种连接，或设备存在但程序报 `OSError: open failed` 时，执行一次：
 
 ```shell
-cd /home/hz/code/YueHu_deoxys/deoxys
-bash installation/create_spacemouse.sh
+cd /home/hz/code/YueHu_deoxys
+bash deoxys/installation/create_spacemouse.sh
 ```
 
 该命令会要求输入 FrankaControl 本机的 sudo 密码，因为它需要向系统目录
@@ -373,11 +416,12 @@ python -c "from deoxys.utils.io_devices import SpaceMouse; d=SpaceMouse(vendor_i
 
 ```shell
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg config/charmander.yml \
+  --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --draw-part-poses \
+  --real-skill-annotation \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
   --prompt-depth-cameras both \
@@ -395,13 +439,16 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 这里只增加 `--task-name round_table`，相机 profile、记录频率和 PromptDA 都沿用
 当前默认值：
 
+`real_skill_annotation_util` 目前只支持 `one_leg`，因此 round-table 命令不要添加
+`--real-skill-annotation`。
+
 ```shell
 source ~/.bashrc
 conda activate deoxys
-cd /home/hz/code/YueHu_deoxys/deoxys
+cd /home/hz/code/YueHu_deoxys
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg config/charmander.yml \
+  --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --spacemouse-connection wired \
@@ -426,13 +473,16 @@ $DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/{success|failure}/
 先完成 `--target lamp` 的相机与零件初始位置 setup，再运行下面的命令。相机
 profile、记录频率和 PromptDA 沿用当前默认值：
 
+`real_skill_annotation_util` 目前只支持 `one_leg`，因此 Lamp 命令不要添加
+`--real-skill-annotation`。
+
 ```shell
 source ~/.bashrc
 conda activate deoxys
-cd /home/hz/code/YueHu_deoxys/deoxys
+cd /home/hz/code/YueHu_deoxys
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg config/charmander.yml \
+  --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --spacemouse-connection wired \
@@ -458,7 +508,7 @@ $DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/{success|failure}/
 
 ```shell
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg config/charmander.yml \
+  --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --spacemouse-connection wired \
@@ -476,6 +526,7 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --wrist-depth-fps 30 \
   --record-fps 10 \
   --draw-part-poses \
+  --real-skill-annotation \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
   --prompt-depth-cameras both \
@@ -509,6 +560,20 @@ Rodrigues 和 `cv2.drawFrameAxes` 投影流程。绿色 `FOUND` 表示当前帧�
 预览和坐标轴只用于屏幕显示，不会写入 pickle RGB 或保存的 MP4。没有图形桌面或
 通过普通 SSH 启动时，添加 `--no-camera-preview`；该参数只关闭窗口，不影响相机
 采集和 `parts_poses` 计算。
+
+`one_leg` 命令中的 `--real-skill-annotation` 会调用同级仓库
+`robust-rearrangement-custom/src/eval/real_skill_annotation_util.py` 的有状态实时接口。
+front 预览会额外显示紫色 guidance point，以及当前 `skill/skill_state`；这些图形只画
+在预览副本上，不会污染保存的原始 RGB。脚本为屏幕预览和写入 episode 分别维护标注
+状态：pickle 中的标注只按实际保存的 `N+1` 个 observation 推进，因此可以用离线工具
+复现。该参数目前只接受 `--task-name one_leg`。
+
+启用后，每个 observation 会保存 `skill`、`skill_state`、`assembly_step`、
+`guidance_point`、`guidance_pose`、`guidance_point_2d`、`grasp_annotation_2d` 和
+`real_annotation_debug`；pickle 根目录增加 `annotation_source`，
+`metadata.real_skill_annotation.mode` 为 `online`、`complete` 为 `true`。如果在线标注
+中途异常，机械臂控制和原始数采不会被强制终止，但终端会打印错误，metadata 的
+`complete` 会变为 `false`；此时应使用 rr 的离线命令重新标注该 pickle。
 
 原始 episode 保存到：
 
@@ -544,7 +609,9 @@ RGB-D 为 `640x480@30`。图像处理没有 `1280x720 -> 640x480 -> 320x240` 这
 应使用 `record_intrinsics`。
 
 pickle 和左右相机拼接 MP4 会由后台线程先写临时文件，再原子重命名。退出程序前应
-等待保存完成，不要在终端刚显示保存按键后立即关机。
+等待保存完成，不要在终端刚显示保存按键后立即关机。每次 pickle 成功写盘后，终端
+会输出当前 task/randomness 目录下的原始文件总数，例如
+`files: success=12 fail=3`；离线生成的 annotated pickle 和临时文件不会计入。
 
 ## Prompt Depth Anything 深度增强
 
@@ -572,11 +639,11 @@ SpaceMouse record 新增的 PromptDA 参数会实时显示 wrist/front 的 RGB�
 ```shell
 source ~/.bashrc
 conda activate deoxys
-cd /home/hz/code/YueHu_deoxys/deoxys
+cd /home/hz/code/YueHu_deoxys
 export HF_ENDPOINT=https://hf-mirror.com
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg config/charmander.yml \
+  --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
   --vendor-id 9583 \
   --spacemouse-connection wired \
@@ -584,6 +651,7 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --record-image-height 240 \
   --record-fps 10 \
   --draw-part-poses \
+  --real-skill-annotation \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
   --prompt-depth-cameras both \
