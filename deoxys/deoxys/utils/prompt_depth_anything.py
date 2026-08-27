@@ -358,8 +358,9 @@ class PromptDepthWorker:
             key: value.copy() if isinstance(value, np.ndarray) else value
             for key, value in camera_sample.items()
         }
+        submitted_wall_time_ns = time.time_ns()
         with self._condition:
-            self._pending = copied
+            self._pending = (copied, submitted_wall_time_ns)
             self._condition.notify()
 
     def latest(self):
@@ -385,11 +386,13 @@ class PromptDepthWorker:
                     self._condition.wait()
                 if not self._running:
                     return
-                sample = self._pending
+                sample, submitted_wall_time_ns = self._pending
                 self._pending = None
 
             result = {
                 "camera_sample": sample,
+                "submitted_wall_time_ns": submitted_wall_time_ns,
+                "processing_started_wall_time_ns": time.time_ns(),
                 "depths": {},
                 "stats": {},
                 "fallbacks": {},
@@ -420,5 +423,6 @@ class PromptDepthWorker:
                     errors.append(f"{camera_name}: {type(exc).__name__}: {exc}")
             if errors:
                 result["error"] = "; ".join(errors)
+            result["ready_wall_time_ns"] = time.time_ns()
             with self._condition:
                 self._latest = result

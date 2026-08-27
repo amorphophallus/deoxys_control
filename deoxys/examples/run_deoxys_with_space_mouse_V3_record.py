@@ -167,6 +167,15 @@ def _array_field(message, *names, size):
     return np.full(size, np.nan, dtype=np.float64)
 
 
+def _message_time_seconds(message):
+    value = getattr(message, "time", None)
+    if value is None:
+        return None
+    if hasattr(value, "toSec"):
+        return float(value.toSec)
+    return float(value)
+
+
 def _gripper_width(robot_interface):
     value = robot_interface.last_gripper_q
     if value is None:
@@ -178,7 +187,19 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
     if not robot_interface._state_buffer or camera_sample is None:
         return None
 
-    state = robot_interface._state_buffer[-1]
+    timestamped_robot_states = robot_interface.timestamped_robot_state_buffer(
+        max_records=1
+    )
+    timestamped_gripper_states = robot_interface.timestamped_gripper_state_buffer(
+        max_records=1
+    )
+    if not timestamped_robot_states:
+        return None
+    robot_record = timestamped_robot_states[-1]
+    gripper_record = (
+        timestamped_gripper_states[-1] if timestamped_gripper_states else None
+    )
+    state = robot_record["message"]
     raw_pose = np.asarray(state.O_T_EE, dtype=np.float64)
     if raw_pose.size != 16:
         return None
@@ -217,6 +238,22 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
     observation.update(
         {
             "control_wall_time_ns": time.time_ns(),
+            "observation_ready_wall_time_ns": time.time_ns(),
+            "robot_state_receive_wall_time_ns": robot_record[
+                "receive_wall_time_ns"
+            ],
+            "robot_state_source_time": _message_time_seconds(state),
+            "robot_state_frame": getattr(state, "frame", None),
+            "gripper_state_receive_wall_time_ns": (
+                None
+                if gripper_record is None
+                else gripper_record["receive_wall_time_ns"]
+            ),
+            "gripper_state_source_time": (
+                None
+                if gripper_record is None
+                else _message_time_seconds(gripper_record["message"])
+            ),
             "robot_state": {
                 "ee_pos": ee_pose[:3, 3].copy(),
                 "ee_quat": ee_quaternion.copy(),
@@ -275,6 +312,15 @@ def _camera_sample_with_prompt_depth(prompt_result, cameras):
         sample[depth_key] = enhanced_depth.astype(np.float16)
     sample["prompt_depth_source_wall_time_ns"] = source_sample.get(
         "camera_capture_wall_time_ns"
+    )
+    sample["prompt_depth_submitted_wall_time_ns"] = prompt_result.get(
+        "submitted_wall_time_ns"
+    )
+    sample["prompt_depth_started_wall_time_ns"] = prompt_result.get(
+        "processing_started_wall_time_ns"
+    )
+    sample["prompt_depth_ready_wall_time_ns"] = prompt_result.get(
+        "ready_wall_time_ns"
     )
     return sample
 
@@ -704,6 +750,7 @@ class RawEpisodeRecorder:
         prompt_depth_config=None,
         annotation_session_factory=None,
         eepose_frame="robot-base",
+        record_fps=10.0,
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
@@ -713,11 +760,16 @@ class RawEpisodeRecorder:
         self.prompt_depth_config = prompt_depth_config
         self.annotation_session_factory = annotation_session_factory
         self.eepose_frame = resolve_eepose_frame(eepose_frame)
+        self.record_fps = float(record_fps)
+        if self.record_fps <= 0:
+            raise ValueError("record_fps must be positive")
         self.annotation_session = None
         self.annotation_error = None
         self.observations = []
         self.actions = []
         self.actions_original = []
+        self.actions_absolute = []
+        self.action_timing = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -766,6 +818,8 @@ class RawEpisodeRecorder:
         self.observations = [initial_observation]
         self.actions = []
         self.actions_original = []
+        self.actions_absolute = []
+        self.action_timing = []
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
         self.last_recorded_gripper = None
@@ -787,7 +841,15 @@ class RawEpisodeRecorder:
         motion = float(np.linalg.norm(action[:6])) > no_op_threshold
         return motion or gripper_changed or self.gripper_hold_remaining > 0
 
-    def append(self, observation, action, action_original=None):
+    def append(
+        self,
+        observation,
+        action,
+        action_original=None,
+        *,
+        action_absolute=None,
+        action_timing=None,
+    ):
         if self.state != "recording" or observation is None:
             return
         if len(self.observations) == len(self.actions):
@@ -801,6 +863,14 @@ class RawEpisodeRecorder:
         self.actions_original.append(
             np.asarray(action_original, dtype=np.float32).copy()
         )
+        if action_absolute is None:
+            action_absolute = np.full(8, np.nan, dtype=np.float32)
+        self.actions_absolute.append(
+            np.asarray(action_absolute, dtype=np.float32).copy()
+        )
+        timing = dict(action_timing or {})
+        timing.setdefault("action_wall_time_ns", observation.get("control_wall_time_ns"))
+        self.action_timing.append(timing)
         gripper = float(np.sign(action[-1]))
         if self.last_recorded_gripper == gripper and self.gripper_hold_remaining > 0:
             self.gripper_hold_remaining -= 1
@@ -856,6 +926,11 @@ class RawEpisodeRecorder:
             "observations": self.observations,
             "actions": self.actions,
             "actions_original": self.actions_original,
+            "actions_absolute": self.actions_absolute,
+            "action_timing": self.action_timing,
+            "action_timestamps_ns": [
+                timing.get("action_wall_time_ns") for timing in self.action_timing
+            ],
             "rewards": [0.0] * len(self.actions),
             "camera_info": self.camera_info,
             "success": bool(success),
@@ -866,8 +941,15 @@ class RawEpisodeRecorder:
             "eepose_original_frame": "real-tip",
             "eepose_schema_version": 2,
             "metadata": {
-                "schema": "deoxys_furniturebench_raw_v3",
+                "schema": "deoxys_furniturebench_raw_v4_timestamped",
                 "controller_observation_alignment": "observation_before_action",
+                "recording_frequency_hz": self.record_fps,
+                "recording_includes_noop_actions": True,
+                "timing_contract": (
+                    "camera sensor source, PromptDA submit/start/ready, robot/gripper "
+                    "state receive, and robot/gripper command send times are stored "
+                    "separately; action_timestamps_ns is the alignment master"
+                ),
                 "parts_poses_frame": "furniture_bench_april_tag",
                 "action_translation_unit": "meter",
                 "action_quaternion_order": "xyzw",
@@ -920,6 +1002,8 @@ class RawEpisodeRecorder:
         self.observations = []
         self.actions = []
         self.actions_original = []
+        self.actions_absolute = []
+        self.action_timing = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -993,6 +1077,24 @@ def scaled_deoxys_action(action, controller_cfg):
     return scaled
 
 
+def delta_action_to_absolute(action, robot_state):
+    """Return ``[absolute xyz, absolute quat_xyzw, gripper]`` for validation."""
+    delta = np.asarray(action, dtype=np.float64).reshape(8)
+    current_pose = np.asarray(robot_state["ee_pose"], dtype=np.float64).reshape(4, 4)
+    target_pose = current_pose.copy()
+    target_pose[:3, 3] = current_pose[:3, 3] + delta[:3]
+    target_pose[:3, :3] = current_pose[:3, :3] @ transform_utils.quat2mat(
+        delta[3:7]
+    )
+    return np.concatenate(
+        [
+            target_pose[:3, 3],
+            transform_utils.mat2quat(target_pose[:3, :3]),
+            [np.sign(delta[-1])],
+        ]
+    ).astype(np.float32)
+
+
 def parse_args():
     default_data_root = os.environ.get("DATA_DIR_RAW")
     parser = argparse.ArgumentParser()
@@ -1051,8 +1153,14 @@ def parse_args():
     parser.add_argument("--record-image-width", type=int, default=320)
     parser.add_argument("--record-image-height", type=int, default=240)
     parser.add_argument("--record-fps", type=float, default=10.0)
-    parser.add_argument("--no-op-threshold", type=float, default=1e-5)
-    parser.add_argument("--gripper-hold-frames", type=int, default=8)
+    # Deprecated compatibility flags. Timestamped v4 recording deliberately
+    # keeps every fixed-rate no-op and therefore does not use either value.
+    parser.add_argument(
+        "--no-op-threshold", type=float, default=1e-5, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--gripper-hold-frames", type=int, default=8, help=argparse.SUPPRESS
+    )
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--draw-part-poses", action="store_true")
     parser.add_argument(
@@ -1197,14 +1305,19 @@ def main():
             prompt_depth_config=prompt_depth_config,
             annotation_session_factory=annotation_session_factory,
             eepose_frame=args.eepose_frame,
+            record_fps=args.record_fps,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
         device.start_control()
-        robot_interface = FrankaInterface(args.interface_cfg, use_visualizer=False)
+        robot_interface = FrankaInterface(
+            args.interface_cfg,
+            control_freq=args.record_fps,
+            use_visualizer=False,
+        )
         controller_cfg = get_default_controller_config(args.controller_type)
         joint_controller_cfg = get_default_controller_config("JOINT_POSITION")
-        robot_interface._state_buffer = []
+        robot_interface.reset()
         if not wait_for_robot_state(robot_interface):
             raise RuntimeError("robot state was not received")
 
@@ -1383,7 +1496,7 @@ def main():
                     break
 
                 scaled_action = scaled_deoxys_action(action, controller_cfg)
-                robot_interface.control(
+                command_timing = robot_interface.control(
                     controller_type=args.controller_type,
                     action=np.asarray(action, dtype=np.float64).copy(),
                     controller_cfg=controller_cfg,
@@ -1394,11 +1507,6 @@ def main():
                     episode.state == "recording"
                     and observation is not None
                     and now >= next_record_time
-                    and episode.should_record(
-                        scaled_action,
-                        args.no_op_threshold,
-                        args.gripper_hold_frames,
-                    )
                 ):
                     saved_action = deoxys_delta_to_furniture_bench_action(
                         scaled_action,
@@ -1410,12 +1518,35 @@ def main():
                         observation["robot_state"]["wrist_pose"],
                         "original",
                     )
+                    saved_action_absolute = delta_action_to_absolute(
+                        saved_action,
+                        observation["robot_state"],
+                    )
                     episode.append(
                         observation,
                         saved_action,
                         saved_action_original,
+                        action_absolute=saved_action_absolute,
+                        action_timing={
+                            "action_wall_time_ns": command_timing[
+                                "robot_command_wall_time_ns"
+                            ],
+                            "robot_command_wall_time_ns": command_timing[
+                                "robot_command_wall_time_ns"
+                            ],
+                            "gripper_command_wall_time_ns": command_timing[
+                                "gripper_command_wall_time_ns"
+                            ],
+                            "observation_ready_wall_time_ns": observation.get(
+                                "observation_ready_wall_time_ns"
+                            ),
+                        },
                     )
-                    next_record_time = now + record_period
+                    missed_periods = max(
+                        1,
+                        int((now - next_record_time) // record_period) + 1,
+                    )
+                    next_record_time += missed_periods * record_period
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
     finally:

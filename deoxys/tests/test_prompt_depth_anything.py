@@ -91,6 +91,14 @@ class PromptDepthAnythingUtilityTest(unittest.TestCase):
             self.assertEqual(
                 set(result["depths"]), {"depth_image1", "depth_image2"}
             )
+            self.assertLessEqual(
+                result["submitted_wall_time_ns"],
+                result["processing_started_wall_time_ns"],
+            )
+            self.assertLessEqual(
+                result["processing_started_wall_time_ns"],
+                result["ready_wall_time_ns"],
+            )
         finally:
             worker.stop()
 

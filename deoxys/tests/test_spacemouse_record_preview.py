@@ -18,6 +18,7 @@ from examples.run_deoxys_with_space_mouse_V3_record import (
     _draw_real_skill_annotation,
     _raw_episode_counts,
     build_observation,
+    delta_action_to_absolute,
     parse_args,
 )
 
@@ -39,6 +40,24 @@ def camera_sample(part_z=1.0, pose_count=6):
         "camera_pose_samples_required": 10,
         "camera_to_april": np.eye(4, dtype=np.float64),
     }
+
+
+class TimestampedActionTest(unittest.TestCase):
+    def test_delta_action_absolute_target_uses_local_right_rotation(self):
+        pose = np.eye(4)
+        pose[:3, 3] = [0.4, 0.1, 0.2]
+        half_angle = np.pi / 4
+        delta = np.array(
+            [0.01, -0.02, 0.03, 0.0, 0.0, np.sin(half_angle), np.cos(half_angle), 1.0]
+        )
+        absolute = delta_action_to_absolute(delta, {"ee_pose": pose})
+        np.testing.assert_allclose(absolute[:3], [0.41, 0.08, 0.23])
+        np.testing.assert_allclose(
+            np.abs(absolute[3:7]),
+            [0.0, 0.0, np.sin(half_angle), np.cos(half_angle)],
+            atol=1e-6,
+        )
+        self.assertEqual(absolute[-1], 1.0)
 
 
 RECORD_INTRINSICS = {

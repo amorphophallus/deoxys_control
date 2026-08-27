@@ -115,9 +115,11 @@ class FrankaInterface:
 
         self._state_buffer = []
         self._state_buffer_idx = 0
+        self._timestamped_robot_state_records = []
 
         self._gripper_state_buffer = []
         self._gripper_buffer_idx = 0
+        self._timestamped_gripper_state_records = []
 
         # control frequency
         self._control_freq = control_freq
@@ -156,6 +158,8 @@ class FrankaInterface:
 
         self.last_gripper_command_counter = 0
         self._history_actions = []
+        self.last_robot_command_wall_time_ns = None
+        self.last_gripper_command_wall_time_ns = None
 
         # automatically reset gripper by default
         self.automatic_gripper_reset = automatic_gripper_reset
@@ -176,7 +180,11 @@ class FrankaInterface:
                 # message = self._subscriber.recv(flags=zmq.NOBLOCK)
                 message = self._subscriber.recv(**recv_kwargs)
                 franka_robot_state.ParseFromString(message)
+                receive_wall_time_ns = time.time_ns()
                 self._state_buffer.append(franka_robot_state)
+                self._timestamped_robot_state_records.append(
+                    (franka_robot_state, receive_wall_time_ns)
+                )
             except:
                 pass
 
@@ -188,7 +196,11 @@ class FrankaInterface:
                 )
                 message = self._gripper_subscriber.recv()
                 franka_gripper_state.ParseFromString(message)
+                receive_wall_time_ns = time.time_ns()
                 self._gripper_state_buffer.append(franka_gripper_state)
+                self._timestamped_gripper_state_records.append(
+                    (franka_gripper_state, receive_wall_time_ns)
+                )
             except:
                 pass
 
@@ -479,11 +491,23 @@ class FrankaInterface:
             msg_str = control_msg.SerializeToString()
             self._publisher.send(msg_str)
 
+        # All supported controller branches publish exactly one arm message
+        # above.  Record the local send completion time separately from policy
+        # target time; callers persist both for latency calibration.
+        self.last_robot_command_wall_time_ns = time.time_ns()
+
         if self.has_gripper:
             self.gripper_control(action[self.last_gripper_dim])
 
         if self.use_visualizer and len(self._state_buffer) > 0:
             self.visualizer.update(joint_positions=np.array(self._state_buffer[-1].q))
+
+        return {
+            "robot_command_wall_time_ns": self.last_robot_command_wall_time_ns,
+            "gripper_command_wall_time_ns": (
+                self.last_gripper_command_wall_time_ns if self.has_gripper else None
+            ),
+        }
 
     def gripper_control(self, action: float):
         """Control the gripper
@@ -521,6 +545,7 @@ class FrankaInterface:
             logger.debug("Gripper closing")
 
             self._gripper_publisher.send(gripper_control_msg.SerializeToString())
+        self.last_gripper_command_wall_time_ns = time.time_ns()
         self.last_gripper_action = action
 
     def close(self):
@@ -575,9 +600,11 @@ class FrankaInterface:
         """Reset internal states of FrankaInterface and clear buffers. Useful when you run multiple episodes in a single python interpretor process."""
         self._state_buffer = []
         self._state_buffer_idx = 0
+        self._timestamped_robot_state_records = []
 
         self._gripper_state_buffer = []
         self._gripper_buffer_idx = 0
+        self._timestamped_gripper_state_records = []
 
         self.counter = 0
         self.termination = False
@@ -587,6 +614,8 @@ class FrankaInterface:
         self.last_gripper_action = 0
         self.last_gripper_command_counter = 0
         self._history_actions = []
+        self.last_robot_command_wall_time_ns = None
+        self.last_gripper_command_wall_time_ns = None
 
     @property
     def received_states(self):
@@ -636,6 +665,35 @@ class FrankaInterface:
     @property
     def gripper_state_buffer_size(self) -> int:
         return len(self._gripper_state_buffer)
+
+    def timestamped_robot_state_buffer(self, max_records=None):
+        """Return a stable snapshot of robot messages and local receive times.
+
+        The protobuf ``time`` field is generated on the NUC and is not assumed
+        to share the RealSense clock.  ``receive_wall_time_ns`` is the local PC
+        wall clock captured immediately after ZMQ receive/parse.
+        """
+        records = (
+            list(self._timestamped_robot_state_records)
+            if max_records is None
+            else list(self._timestamped_robot_state_records[-int(max_records) :])
+        )
+        return [
+            {"message": message, "receive_wall_time_ns": receive_wall_time_ns}
+            for message, receive_wall_time_ns in records
+        ]
+
+    def timestamped_gripper_state_buffer(self, max_records=None):
+        """Return a stable snapshot of gripper messages and receive times."""
+        records = (
+            list(self._timestamped_gripper_state_records)
+            if max_records is None
+            else list(self._timestamped_gripper_state_records[-int(max_records) :])
+        )
+        return [
+            {"message": message, "receive_wall_time_ns": receive_wall_time_ns}
+            for message, receive_wall_time_ns in records
+        ]
 
     @property
     def ip(self) -> str:

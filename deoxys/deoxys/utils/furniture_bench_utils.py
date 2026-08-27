@@ -171,6 +171,7 @@ class RealSenseCamera:
         self.depth_scale_m = None
         self.intrinsics = None
         self.depth_intrinsics = None
+        self.global_time_enabled = False
 
     def start(self):
         config = rs.config()
@@ -203,6 +204,11 @@ class RealSenseCamera:
             self.depth_intrinsics = depth_profile.get_intrinsics()
         color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
         self.intrinsics = color_profile.get_intrinsics()
+        global_time_option = getattr(rs.option, "global_time_enabled", None)
+        for sensor in device.query_sensors():
+            if global_time_option is not None and sensor.supports(global_time_option):
+                sensor.set_option(global_time_option, 1.0)
+                self.global_time_enabled = True
         if not self.auto_exposure:
             for sensor in device.query_sensors():
                 if sensor.supports(rs.option.enable_auto_exposure):
@@ -234,6 +240,7 @@ class RealSenseCamera:
             "bgr": np.asanyarray(color_frame.get_data()).copy(),
             "depth_m": depth_m,
             "sensor_timestamp_ms": float(color_frame.get_timestamp()),
+            "timestamp_domain": str(color_frame.get_frame_timestamp_domain()),
             "frame_number": int(color_frame.get_frame_number()),
             "wall_time_ns": time.time_ns(),
         }
@@ -246,6 +253,7 @@ class RealSenseCamera:
             "stream_width": self.width,
             "stream_height": self.height,
             "fps": self.fps,
+            "global_time_enabled": self.global_time_enabled,
             "depth_enabled": self.enable_depth,
             "depth_scale_m": self.depth_scale_m,
             "depth_stream_width": self.depth_width if self.enable_depth else None,
@@ -588,8 +596,12 @@ class DualRealSenseSnapshotter:
                         cv2.INTER_NEAREST,
                     ).astype(np.float16),
                     "camera_capture_wall_time_ns": time.time_ns(),
+                    "front_receive_wall_time_ns": front["wall_time_ns"],
+                    "wrist_receive_wall_time_ns": wrist["wall_time_ns"],
                     "front_sensor_timestamp_ms": front["sensor_timestamp_ms"],
                     "wrist_sensor_timestamp_ms": wrist["sensor_timestamp_ms"],
+                    "front_timestamp_domain": front["timestamp_domain"],
+                    "wrist_timestamp_domain": wrist["timestamp_domain"],
                     "front_frame_number": front["frame_number"],
                     "wrist_frame_number": wrist["frame_number"],
                 }
