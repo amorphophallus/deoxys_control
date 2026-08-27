@@ -11,6 +11,8 @@ from deoxys.utils.furniture_bench_utils import (
     center_crop_resize,
     center_crop_resize_geometry,
     deoxys_delta_to_furniture_bench_action,
+    eepose_from_wrist_pose,
+    resolve_eepose_frame,
     transformed_intrinsics,
 )
 
@@ -63,7 +65,7 @@ class FurnitureBenchActionTest(unittest.TestCase):
         )
         self.assertEqual(action[-1], -1.0)
 
-    def test_world_left_wrist_delta_becomes_local_tip_delta(self):
+    def test_world_left_wrist_delta_becomes_local_wrist_delta_by_default(self):
         wrist_pose = np.eye(4)
         wrist_pose[:3, :3] = transform_utils.quat2mat(
             transform_utils.axisangle2quat(np.array([0.2, -0.1, 0.3]))
@@ -80,13 +82,11 @@ class FurnitureBenchActionTest(unittest.TestCase):
         goal_wrist = wrist_pose.copy()
         goal_wrist[:3, 3] += scaled_action[:3]
         goal_wrist[:3, :3] = world_delta @ wrist_pose[:3, :3]
-        current_tip = wrist_pose @ WRIST_TO_TIP
-        goal_tip = goal_wrist @ WRIST_TO_TIP
-        expected_rotation = current_tip[:3, :3].T @ goal_tip[:3, :3]
+        expected_rotation = wrist_pose[:3, :3].T @ goal_wrist[:3, :3]
 
         np.testing.assert_allclose(
             converted[:3],
-            goal_tip[:3, 3] - current_tip[:3, 3],
+            goal_wrist[:3, 3] - wrist_pose[:3, 3],
             atol=1e-7,
         )
         np.testing.assert_allclose(
@@ -95,6 +95,44 @@ class FurnitureBenchActionTest(unittest.TestCase):
             atol=1e-6,
         )
         self.assertEqual(converted[-1], 1.0)
+
+    def test_original_mode_exactly_preserves_local_tip_delta(self):
+        wrist_pose = np.eye(4)
+        scaled_action = np.array([0.01, -0.02, 0.005, 0.04, 0.02, -0.03, 1.0])
+        converted = deoxys_delta_to_furniture_bench_action(
+            scaled_action,
+            wrist_pose,
+            "original",
+        )
+        world_delta = transform_utils.quat2mat(
+            transform_utils.axisangle2quat(scaled_action[3:6])
+        )
+        goal_wrist = wrist_pose.copy()
+        goal_wrist[:3, 3] += scaled_action[:3]
+        goal_wrist[:3, :3] = world_delta @ wrist_pose[:3, :3]
+        current_tip = wrist_pose @ WRIST_TO_TIP
+        goal_tip = goal_wrist @ WRIST_TO_TIP
+        np.testing.assert_allclose(
+            converted[:3], goal_tip[:3, 3] - current_tip[:3, 3], atol=1e-7
+        )
+        np.testing.assert_allclose(
+            transform_utils.quat2mat(converted[3:7]),
+            current_tip[:3, :3].T @ goal_tip[:3, :3],
+            atol=1e-6,
+        )
+
+    def test_eepose_selection_preserves_legacy_tip(self):
+        wrist = np.eye(4)
+        np.testing.assert_allclose(eepose_from_wrist_pose(wrist), wrist)
+        np.testing.assert_allclose(
+            eepose_from_wrist_pose(wrist, "original"), wrist @ WRIST_TO_TIP
+        )
+        self.assertEqual(resolve_eepose_frame("original"), "real-tip")
+        self.assertEqual(
+            resolve_eepose_frame("original"), resolve_eepose_frame("real-tip")
+        )
+        with self.assertRaises(ValueError):
+            resolve_eepose_frame("original=real-tip")
 
 
 class FurnitureBenchImageTransformTest(unittest.TestCase):

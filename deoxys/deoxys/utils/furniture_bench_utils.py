@@ -23,6 +23,30 @@ WRIST_TO_TIP[:3, :3] = transform_utils.quat2mat(
     np.array([0.0, 0.0, -0.3826834323650898, 0.9238795325112867])
 )
 
+ROBOT_BASE_EEPOSE_FRAME = "robot-base"
+REAL_TIP_EEPOSE_FRAME = "real-tip"
+
+
+def resolve_eepose_frame(frame_spec):
+    """Resolve the real-robot EE representation selected by the CLI."""
+    value = str(frame_spec).strip().lower().replace("_", "-")
+    aliases = {
+        "base": ROBOT_BASE_EEPOSE_FRAME,
+        "robot": ROBOT_BASE_EEPOSE_FRAME,
+        "robot-base": ROBOT_BASE_EEPOSE_FRAME,
+        "original": REAL_TIP_EEPOSE_FRAME,
+        "tip": REAL_TIP_EEPOSE_FRAME,
+        "real-tip": REAL_TIP_EEPOSE_FRAME,
+        "virtual-tip": REAL_TIP_EEPOSE_FRAME,
+    }
+    try:
+        return aliases[value]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported real eepose frame {frame_spec!r}; expected "
+            "robot-base, original, or real-tip"
+        ) from exc
+
 
 def camera_intrinsics_vector(intrinsics):
     return [
@@ -631,8 +655,21 @@ def wrist_pose_to_tip_pose(wrist_pose):
     return np.asarray(wrist_pose, dtype=np.float64).reshape(4, 4) @ WRIST_TO_TIP
 
 
-def deoxys_delta_to_furniture_bench_action(scaled_action, wrist_pose):
-    """Convert a scaled Deoxys world-left wrist delta to a local tip delta."""
+def eepose_from_wrist_pose(wrist_pose, eepose_frame="robot-base"):
+    """Return the selected EE rigid-body pose, always expressed in robot base."""
+    wrist_pose = np.asarray(wrist_pose, dtype=np.float64).reshape(4, 4)
+    resolved = resolve_eepose_frame(eepose_frame)
+    if resolved == ROBOT_BASE_EEPOSE_FRAME:
+        return wrist_pose.copy()
+    return wrist_pose_to_tip_pose(wrist_pose)
+
+
+def deoxys_delta_to_furniture_bench_action(
+    scaled_action,
+    wrist_pose,
+    eepose_frame="robot-base",
+):
+    """Convert a Deoxys world-left wrist delta to a local selected-EE delta."""
     action = np.asarray(scaled_action, dtype=np.float64).reshape(7)
     current_wrist = np.asarray(wrist_pose, dtype=np.float64).reshape(4, 4)
     goal_wrist = current_wrist.copy()
@@ -642,10 +679,10 @@ def deoxys_delta_to_furniture_bench_action(scaled_action, wrist_pose):
     )
     goal_wrist[:3, :3] = world_delta_rotation @ current_wrist[:3, :3]
 
-    current_tip = wrist_pose_to_tip_pose(current_wrist)
-    goal_tip = wrist_pose_to_tip_pose(goal_wrist)
-    delta_position = goal_tip[:3, 3] - current_tip[:3, 3]
-    local_delta_rotation = current_tip[:3, :3].T @ goal_tip[:3, :3]
+    current_ee = eepose_from_wrist_pose(current_wrist, eepose_frame)
+    goal_ee = eepose_from_wrist_pose(goal_wrist, eepose_frame)
+    delta_position = goal_ee[:3, 3] - current_ee[:3, 3]
+    local_delta_rotation = current_ee[:3, :3].T @ goal_ee[:3, :3]
     delta_quaternion = transform_utils.mat2quat(local_delta_rotation)
     return np.concatenate(
         [delta_position, delta_quaternion, [np.sign(action[-1])]],

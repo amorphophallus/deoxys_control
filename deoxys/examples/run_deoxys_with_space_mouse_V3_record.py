@@ -23,6 +23,8 @@ from deoxys.utils.furniture_bench_utils import (
     DEFAULT_WRIST_SERIAL,
     DualRealSenseSnapshotter,
     deoxys_delta_to_furniture_bench_action,
+    eepose_from_wrist_pose,
+    resolve_eepose_frame,
     wrist_pose_to_tip_pose,
 )
 from deoxys.utils.input_utils import input2action
@@ -170,7 +172,7 @@ def _gripper_width(robot_interface):
     return float(np.asarray(value).reshape(-1)[0])
 
 
-def build_observation(robot_interface, camera_sample):
+def build_observation(robot_interface, camera_sample, eepose_frame="robot-base"):
     if not robot_interface._state_buffer or camera_sample is None:
         return None
 
@@ -180,12 +182,19 @@ def build_observation(robot_interface, camera_sample):
         return None
     wrist_pose = raw_pose.reshape(4, 4).transpose()
     tip_pose = wrist_pose_to_tip_pose(wrist_pose)
+    ee_pose = eepose_from_wrist_pose(wrist_pose, eepose_frame)
+    ee_quaternion = transform_utils.mat2quat(ee_pose[:3, :3])
     tip_quaternion = transform_utils.mat2quat(tip_pose[:3, :3])
     ee_velocity = _array_field(state, "O_dP_EE_c", "O_dP_EE", size=6)
     tip_offset_in_base = tip_pose[:3, 3] - wrist_pose[:3, 3]
     tip_linear_velocity = ee_velocity[:3] + np.cross(
         ee_velocity[3:],
         tip_offset_in_base,
+    )
+    ee_linear_velocity = (
+        ee_velocity[:3]
+        if resolve_eepose_frame(eepose_frame) == "robot-base"
+        else tip_linear_velocity
     )
 
     observation = {
@@ -196,11 +205,14 @@ def build_observation(robot_interface, camera_sample):
         {
             "control_wall_time_ns": time.time_ns(),
             "robot_state": {
-                "ee_pos": tip_pose[:3, 3].copy(),
-                "ee_quat": tip_quaternion.copy(),
-                "ee_pose": tip_pose.copy(),
+                "ee_pos": ee_pose[:3, 3].copy(),
+                "ee_quat": ee_quaternion.copy(),
+                "ee_pose": ee_pose.copy(),
+                "ee_pos_original": tip_pose[:3, 3].copy(),
+                "ee_quat_original": tip_quaternion.copy(),
+                "ee_pose_original": tip_pose.copy(),
                 "wrist_pose": wrist_pose.copy(),
-                "ee_pos_vel": tip_linear_velocity,
+                "ee_pos_vel": ee_linear_velocity,
                 "ee_ori_vel": ee_velocity[3:],
                 "joint_positions": _array_field(state, "q", size=7),
                 "joint_velocities": _array_field(state, "dq", size=7),
@@ -678,6 +690,7 @@ class RawEpisodeRecorder:
         writer,
         prompt_depth_config=None,
         annotation_session_factory=None,
+        eepose_frame="robot-base",
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
@@ -686,10 +699,12 @@ class RawEpisodeRecorder:
         self.writer = writer
         self.prompt_depth_config = prompt_depth_config
         self.annotation_session_factory = annotation_session_factory
+        self.eepose_frame = resolve_eepose_frame(eepose_frame)
         self.annotation_session = None
         self.annotation_error = None
         self.observations = []
         self.actions = []
+        self.actions_original = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -737,6 +752,7 @@ class RawEpisodeRecorder:
                 return False
         self.observations = [initial_observation]
         self.actions = []
+        self.actions_original = []
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
         self.last_recorded_gripper = None
@@ -758,7 +774,7 @@ class RawEpisodeRecorder:
         motion = float(np.linalg.norm(action[:6])) > no_op_threshold
         return motion or gripper_changed or self.gripper_hold_remaining > 0
 
-    def append(self, observation, action):
+    def append(self, observation, action, action_original=None):
         if self.state != "recording" or observation is None:
             return
         if len(self.observations) == len(self.actions):
@@ -767,6 +783,11 @@ class RawEpisodeRecorder:
         if len(self.observations) != len(self.actions) + 1:
             raise RuntimeError("invalid observation/action alignment")
         self.actions.append(np.asarray(action, dtype=np.float32).copy())
+        if action_original is None:
+            action_original = action
+        self.actions_original.append(
+            np.asarray(action_original, dtype=np.float32).copy()
+        )
         gripper = float(np.sign(action[-1]))
         if self.last_recorded_gripper == gripper and self.gripper_hold_remaining > 0:
             self.gripper_hold_remaining -= 1
@@ -821,19 +842,36 @@ class RawEpisodeRecorder:
         payload = {
             "observations": self.observations,
             "actions": self.actions,
+            "actions_original": self.actions_original,
             "rewards": [0.0] * len(self.actions),
             "camera_info": self.camera_info,
             "success": bool(success),
             "task": self.task_name,
             "furniture": self.task_name,
             "action_type": "delta",
+            "eepose_frame": self.eepose_frame,
+            "eepose_original_frame": "real-tip",
+            "eepose_schema_version": 2,
             "metadata": {
-                "schema": "deoxys_furniturebench_raw_v2",
+                "schema": "deoxys_furniturebench_raw_v3",
                 "controller_observation_alignment": "observation_before_action",
                 "parts_poses_frame": "furniture_bench_april_tag",
                 "action_translation_unit": "meter",
                 "action_quaternion_order": "xyzw",
-                "action_rotation_semantics": "right_multiply_local_tip_delta",
+                "action_rotation_semantics": (
+                    "right_multiply_local_wrist_delta"
+                    if self.eepose_frame == "robot-base"
+                    else "right_multiply_local_tip_delta"
+                ),
+                "eepose_frame": self.eepose_frame,
+                "eepose_original_frame": "real-tip",
+                "eepose_schema_version": 2,
+                "action_frame": (
+                    "robot-base/wrist"
+                    if self.eepose_frame == "robot-base"
+                    else "robot-base/real-tip"
+                ),
+                "action_original_frame": "robot-base/real-tip",
                 "randomness": self.randomness,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
@@ -861,6 +899,7 @@ class RawEpisodeRecorder:
         action_count = len(self.actions)
         self.observations = []
         self.actions = []
+        self.actions_original = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -939,6 +978,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--interface-cfg", default="config/charmander.yml")
     parser.add_argument("--controller-type", default="OSC_POSE")
+    parser.add_argument(
+        "--eepose-frame",
+        default="robot-base",
+        help=(
+            "EE pose/action representation: robot-base (default), or original/"
+            "real-tip for the legacy 10.34 cm/-45 degree virtual tip"
+        ),
+    )
     parser.add_argument("--vendor-id", type=int, default=9583)
     parser.add_argument(
         "--spacemouse-connection",
@@ -1035,6 +1082,10 @@ def parse_args():
         parser.error("--data-root is required when DATA_DIR_RAW is not set")
     if args.record_fps <= 0:
         parser.error("--record-fps must be greater than zero")
+    try:
+        resolve_eepose_frame(args.eepose_frame)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.real_skill_annotation and args.task_name != "one_leg":
         parser.error(
             "--real-skill-annotation currently supports only --task-name one_leg"
@@ -1125,6 +1176,7 @@ def main():
             writer=writer,
             prompt_depth_config=prompt_depth_config,
             annotation_session_factory=annotation_session_factory,
+            eepose_frame=args.eepose_frame,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
@@ -1168,6 +1220,7 @@ def main():
                 observation = build_observation(
                     robot_interface,
                     observation_camera_sample,
+                    args.eepose_frame,
                 )
                 annotation_observation = None
                 if (
@@ -1330,8 +1383,18 @@ def main():
                     saved_action = deoxys_delta_to_furniture_bench_action(
                         scaled_action,
                         observation["robot_state"]["wrist_pose"],
+                        args.eepose_frame,
                     )
-                    episode.append(observation, saved_action)
+                    saved_action_original = deoxys_delta_to_furniture_bench_action(
+                        scaled_action,
+                        observation["robot_state"]["wrist_pose"],
+                        "original",
+                    )
+                    episode.append(
+                        observation,
+                        saved_action,
+                        saved_action_original,
+                    )
                     next_record_time = now + record_period
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
