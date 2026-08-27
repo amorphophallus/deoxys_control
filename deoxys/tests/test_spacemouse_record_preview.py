@@ -17,6 +17,7 @@ from examples.run_deoxys_with_space_mouse_V3_record import (
     _draw_front_part_poses,
     _draw_real_skill_annotation,
     _raw_episode_counts,
+    build_observation,
     parse_args,
 )
 
@@ -113,6 +114,33 @@ class SpaceMouseConnectionTest(unittest.TestCase):
         self.assertFalse(device.thread.is_alive())
         hid_device.set_nonblocking.assert_called_once_with(1)
         hid_device.close.assert_called_once_with()
+
+
+class MeasuredEEVelocityTest(unittest.TestCase):
+    def test_observation_uses_measured_dq_when_commanded_twist_is_zero(self):
+        state = MagicMock()
+        state.q = [0.1, -0.2, 0.3, -1.8, 0.2, 1.7, 0.5]
+        state.dq = [0.2, -0.1, 0.15, 0.05, -0.2, 0.1, 0.3]
+        state.O_dP_EE_c = [0.0] * 6
+        state.O_T_EE = np.eye(4, dtype=np.float64).T.reshape(-1).tolist()
+        state.tau_J = [0.0] * 7
+
+        robot_interface = MagicMock()
+        robot_interface._state_buffer = [state]
+        robot_interface.last_gripper_q = np.array([0.04])
+        observation = build_observation(
+            robot_interface,
+            camera_sample(),
+            eepose_frame="robot-base",
+        )
+
+        velocity = np.r_[
+            observation["robot_state"]["ee_pos_vel"],
+            observation["robot_state"]["ee_ori_vel"],
+        ]
+        self.assertTrue(np.all(np.isfinite(velocity)))
+        self.assertGreater(np.linalg.norm(velocity), 0.0)
+        self.assertFalse(np.allclose(velocity, state.O_dP_EE_c))
 
 
 class PartPosePreviewTest(unittest.TestCase):

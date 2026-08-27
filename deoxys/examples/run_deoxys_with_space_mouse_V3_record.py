@@ -36,6 +36,7 @@ from deoxys.utils.prompt_depth_anything import (
     colorize_depth,
     depth_display_bounds,
 )
+from deoxys.utils.panda_kinematics import PandaKinematics
 from deoxys.utils.video_utils import H264VideoWriter
 
 
@@ -100,6 +101,7 @@ REAL_ANNOTATION_OUTPUT_FIELDS = (
     "real_annotation_debug",
 )
 RAW_EPISODE_GLOB = "????-??-??T??-??-??.??????.pkl"
+PANDA_KINEMATICS = PandaKinematics()
 
 
 def _create_real_skill_annotation_session(task_name, camera_info):
@@ -185,7 +187,18 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
     ee_pose = eepose_from_wrist_pose(wrist_pose, eepose_frame)
     ee_quaternion = transform_utils.mat2quat(ee_pose[:3, :3])
     tip_quaternion = transform_utils.mat2quat(tip_pose[:3, :3])
-    ee_velocity = _array_field(state, "O_dP_EE_c", "O_dP_EE", size=6)
+    joint_positions = _array_field(state, "q", size=7)
+    joint_velocities = _array_field(state, "dq", size=7)
+    if not (
+        np.all(np.isfinite(joint_positions))
+        and np.all(np.isfinite(joint_velocities))
+    ):
+        return None
+    ee_velocity = PANDA_KINEMATICS.ee_twist(
+        joint_positions,
+        joint_velocities,
+        wrist_pose[:3, 3],
+    )
     tip_offset_in_base = tip_pose[:3, 3] - wrist_pose[:3, 3]
     tip_linear_velocity = ee_velocity[:3] + np.cross(
         ee_velocity[3:],
@@ -214,8 +227,8 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
                 "wrist_pose": wrist_pose.copy(),
                 "ee_pos_vel": ee_linear_velocity,
                 "ee_ori_vel": ee_velocity[3:],
-                "joint_positions": _array_field(state, "q", size=7),
-                "joint_velocities": _array_field(state, "dq", size=7),
+                "joint_positions": joint_positions,
+                "joint_velocities": joint_velocities,
                 "joint_torques": _array_field(
                     state,
                     "tau_J",
@@ -866,6 +879,13 @@ class RawEpisodeRecorder:
                 "eepose_frame": self.eepose_frame,
                 "eepose_original_frame": "real-tip",
                 "eepose_schema_version": 2,
+                "ee_velocity_source": "geometric_jacobian_times_measured_dq",
+                "ee_velocity_frame": "robot-base",
+                "ee_velocity_point": (
+                    "franka_O_T_EE"
+                    if self.eepose_frame == "robot-base"
+                    else "real-tip"
+                ),
                 "action_frame": (
                     "robot-base/wrist"
                     if self.eepose_frame == "robot-base"
