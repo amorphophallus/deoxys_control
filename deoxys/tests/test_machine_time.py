@@ -1,5 +1,7 @@
 import inspect
+import threading
 import unittest
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -58,6 +60,32 @@ class MachineTimeScheduleTest(unittest.TestCase):
 
         self.assertTrue(parameters["control_gripper"].default)
         self.assertTrue(parameters["enforce_control_frequency"].default)
+
+    def test_franka_close_releases_both_receivers_and_all_sockets(self):
+        interface = FrankaInterface.__new__(FrankaInterface)
+        interface._closed = False
+        interface._stop_event = threading.Event()
+        interface._state_sub_thread = MagicMock()
+        interface._gripper_sub_thread = MagicMock()
+        interface._subscriber = MagicMock()
+        interface._gripper_subscriber = MagicMock()
+        interface._publisher = MagicMock()
+        interface._gripper_publisher = MagicMock()
+        interface._context = MagicMock()
+
+        interface.close()
+
+        self.assertTrue(interface._stop_event.is_set())
+        interface._state_sub_thread.join.assert_called_once_with(timeout=2.0)
+        interface._gripper_sub_thread.join.assert_called_once_with(timeout=2.0)
+        for socket in (
+            interface._subscriber,
+            interface._gripper_subscriber,
+            interface._publisher,
+            interface._gripper_publisher,
+        ):
+            socket.close.assert_called_once_with(linger=0)
+        interface._context.term.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -100,7 +100,8 @@ class PromptDepthAnythingUtilityTest(unittest.TestCase):
                 result["ready_wall_time_ns"],
             )
         finally:
-            worker.stop()
+            self.assertTrue(worker.stop())
+            self.assertIsNone(worker._thread)
 
 
 if __name__ == "__main__":

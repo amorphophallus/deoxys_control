@@ -367,12 +367,24 @@ class PromptDepthWorker:
         with self._condition:
             return self._latest
 
-    def stop(self):
+    def stop(self, timeout=None):
+        """Stop after the in-flight inference completes.
+
+        The default intentionally waits without a timeout: returning while the
+        daemon thread still owns CUDA/native model state can corrupt process
+        teardown.  Callers that provide a timeout must handle a ``False``
+        return and keep the estimator alive.
+        """
+
         with self._condition:
             self._running = False
             self._condition.notify_all()
         if self._thread is not None:
-            self._thread.join(timeout=10.0)
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                return False
+            self._thread = None
+        return True
 
     def _run(self):
         camera_fields = {

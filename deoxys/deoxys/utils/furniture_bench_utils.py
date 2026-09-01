@@ -655,12 +655,18 @@ class DualRealSenseSnapshotter:
             },
         }
 
-    def stop(self):
+    def stop(self, timeout=None):
+        """Stop capture before tearing down either native RealSense pipeline."""
+
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                return False
+            self._thread = None
         self.wrist.stop()
         self.front.stop()
+        return True
 
 
 def wrist_pose_to_tip_pose(wrist_pose):

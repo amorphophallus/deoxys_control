@@ -1,11 +1,14 @@
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import cv2
 import numpy as np
 
 from deoxys.utils import transform_utils
 from deoxys.utils.furniture_bench_utils import (
+    DualRealSenseSnapshotter,
     FurniturePoseTracker,
     WRIST_TO_TIP,
     center_crop_resize,
@@ -15,6 +18,22 @@ from deoxys.utils.furniture_bench_utils import (
     resolve_eepose_frame,
     transformed_intrinsics,
 )
+
+
+class DualRealSenseShutdownTest(unittest.TestCase):
+    def test_capture_thread_finishes_before_native_pipelines_stop(self):
+        snapshotter = DualRealSenseSnapshotter.__new__(DualRealSenseSnapshotter)
+        snapshotter._stop_event = threading.Event()
+        snapshotter._thread = MagicMock()
+        snapshotter._thread.is_alive.return_value = False
+        snapshotter.wrist = MagicMock()
+        snapshotter.front = MagicMock()
+
+        self.assertTrue(snapshotter.stop())
+
+        self.assertIsNone(snapshotter._thread)
+        snapshotter.wrist.stop.assert_called_once_with()
+        snapshotter.front.stop.assert_called_once_with()
 
 
 class FurniturePoseTrackerTest(unittest.TestCase):

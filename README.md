@@ -696,6 +696,15 @@ gripper 使用一次公共 stale-prefix 筛选，再按各自 latency 在 target
 fallback。四个 checkpoint 的旧 Real40 数据属于 `legacy_v2_proxy` 近似对齐，可以
 正常 eval；该 provenance 不会切换或放宽真机 stale-action 规则。
 
+在 FrankaControl 上必须保持启动顺序为“两路 RealSense 管线 → CUDA policy →
+PromptDA/Deoxys”。这不是性能优化：该机器上如果先初始化 CUDA 再启动
+librealsense，会在退出阶段触发 glibc heap corruption；`evaluate_policy` 已固定该顺序，
+不要把 checkpoint 加载移回相机启动之前。dry-run warmup 如果报告
+`PromptDA ready=True` 但 `robot states=0, gripper states=0`，说明视觉链路正常而 NUC
+状态发布器未就绪。先在 Franka Desk 确认 FCI，再由现场操作员按既有流程在 NUC 启动
+`/home/mingyu/code/deoxys_control/deoxys/run2.sh` 和 `run3.sh`；不要用放宽超时或直接
+加 `--execute` 绕过检查。
+
 先准备环境变量和公共安全参数。第一次运行应暂时从 `RR_EVAL_ARGS` 删除 `--execute`
 完成 dry-run；确认相机时间域、PromptDA、checkpoint 和状态插值正常后，再恢复
 `--execute`。workspace 数值是当前 one-leg 配置，工作台或机器人基座位置改变后必须

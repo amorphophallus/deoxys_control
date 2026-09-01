@@ -108,9 +108,11 @@ class FrankaInterface:
 
         # subscriber
         self._subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._subscriber.setsockopt(zmq.RCVTIMEO, 100)
         self._subscriber.connect(f"tcp://{self._ip}:{self._sub_port}")
 
         self._gripper_subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._gripper_subscriber.setsockopt(zmq.RCVTIMEO, 100)
         self._gripper_subscriber.connect(f"tcp://{self._ip}:{self._gripper_sub_port}")
 
         self._state_buffer = []
@@ -133,6 +135,8 @@ class FrankaInterface:
 
         self.counter = 0
         self.termination = False
+        self._stop_event = threading.Event()
+        self._closed = False
 
         self._state_sub_thread = threading.Thread(target=self.get_state)
         self._state_sub_thread.daemon = True
@@ -174,7 +178,7 @@ class FrankaInterface:
             recv_kwargs = {"flags": zmq.NOBLOCK}
         else:
             recv_kwargs = {}
-        while True:
+        while not self._stop_event.is_set():
             try:
                 franka_robot_state = franka_robot_state_pb2.FrankaRobotStateMessage()
                 # message = self._subscriber.recv(flags=zmq.NOBLOCK)
@@ -185,11 +189,17 @@ class FrankaInterface:
                 self._timestamped_robot_state_records.append(
                     (franka_robot_state, receive_wall_time_ns)
                 )
-            except:
-                pass
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                if self._stop_event.is_set():
+                    return
+            except Exception:
+                if self._stop_event.is_set():
+                    return
 
     def get_gripper_state(self):
-        while True:
+        while not self._stop_event.is_set():
             try:
                 franka_gripper_state = (
                     franka_robot_state_pb2.FrankaGripperStateMessage()
@@ -201,8 +211,14 @@ class FrankaInterface:
                 self._timestamped_gripper_state_records.append(
                     (franka_gripper_state, receive_wall_time_ns)
                 )
-            except:
-                pass
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                if self._stop_event.is_set():
+                    return
+            except Exception:
+                if self._stop_event.is_set():
+                    return
 
     def preprocess(self):
 
@@ -558,7 +574,22 @@ class FrankaInterface:
         self.last_gripper_action = action
 
     def close(self):
-        self._state_sub_thread.join(1.0)
+        """Stop receiver threads and release all ZMQ endpoints deterministically."""
+
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        self._stop_event.set()
+        for thread in (self._state_sub_thread, self._gripper_sub_thread):
+            thread.join(timeout=2.0)
+        for socket in (
+            self._subscriber,
+            self._gripper_subscriber,
+            self._publisher,
+            self._gripper_publisher,
+        ):
+            socket.close(linger=0)
+        self._context.term()
 
     @property
     def last_eef_pose(self) -> np.ndarray:
