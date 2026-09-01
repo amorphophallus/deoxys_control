@@ -30,6 +30,10 @@ from deoxys.utils.furniture_bench_utils import (
 from deoxys.utils.input_utils import input2action
 from deoxys.utils.io_devices import SpaceMouse
 from deoxys.utils.log_utils import get_deoxys_example_logger
+from deoxys.utils.machine_time import (
+    MachineTimeSchedule,
+    monotonic_target_to_wall_time_ns,
+)
 from deoxys.utils.prompt_depth_anything import (
     PromptDepthAnythingEstimator,
     PromptDepthWorker,
@@ -751,6 +755,12 @@ class RawEpisodeRecorder:
         annotation_session_factory=None,
         eepose_frame="robot-base",
         record_fps=10.0,
+        robot_action_latency_ms=10.0,
+        gripper_action_latency_ms=10.0,
+        action_stale_guard_ms=10.0,
+        max_command_lateness_ms=10.0,
+        robot_observation_latency_ms=0.0,
+        gripper_observation_latency_ms=0.0,
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
@@ -763,6 +773,20 @@ class RawEpisodeRecorder:
         self.record_fps = float(record_fps)
         if self.record_fps <= 0:
             raise ValueError("record_fps must be positive")
+        self.machine_time_schedule = MachineTimeSchedule.from_milliseconds(
+            robot_action_ms=robot_action_latency_ms,
+            gripper_action_ms=gripper_action_latency_ms,
+            stale_guard_ms=action_stale_guard_ms,
+            dispatch_tolerance_ms=max_command_lateness_ms,
+        )
+        for name, value in (
+            ("robot_observation_latency_ms", robot_observation_latency_ms),
+            ("gripper_observation_latency_ms", gripper_observation_latency_ms),
+        ):
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        self.robot_observation_latency_ms = float(robot_observation_latency_ms)
+        self.gripper_observation_latency_ms = float(gripper_observation_latency_ms)
         self.annotation_session = None
         self.annotation_error = None
         self.observations = []
@@ -770,6 +794,7 @@ class RawEpisodeRecorder:
         self.actions_original = []
         self.actions_absolute = []
         self.action_timing = []
+        self.command_attempts = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -820,6 +845,7 @@ class RawEpisodeRecorder:
         self.actions_original = []
         self.actions_absolute = []
         self.action_timing = []
+        self.command_attempts = []
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
         self.last_recorded_gripper = None
@@ -869,12 +895,30 @@ class RawEpisodeRecorder:
             np.asarray(action_absolute, dtype=np.float32).copy()
         )
         timing = dict(action_timing or {})
-        timing.setdefault("action_wall_time_ns", observation.get("control_wall_time_ns"))
+        timing.setdefault(
+            "action_target_wall_time_ns",
+            timing.get(
+                "action_wall_time_ns",
+                observation.get("control_wall_time_ns"),
+            ),
+        )
+        timing["action_wall_time_ns"] = timing["action_target_wall_time_ns"]
+        timing.setdefault("status", "executed")
         self.action_timing.append(timing)
+        self.command_attempts.append(dict(timing))
         gripper = float(np.sign(action[-1]))
         if self.last_recorded_gripper == gripper and self.gripper_hold_remaining > 0:
             self.gripper_hold_remaining -= 1
         self.last_recorded_gripper = gripper
+
+    def record_dropped_command(self, timing):
+        """Keep a stale/failed command in audit metadata, never in training arrays."""
+
+        if self.state != "recording":
+            return
+        attempt = dict(timing)
+        attempt.setdefault("status", "dropped")
+        self.command_attempts.append(attempt)
 
     def stop(self, final_observation):
         if self.state != "recording":
@@ -929,8 +973,14 @@ class RawEpisodeRecorder:
             "actions_absolute": self.actions_absolute,
             "action_timing": self.action_timing,
             "action_timestamps_ns": [
-                timing.get("action_wall_time_ns") for timing in self.action_timing
+                timing.get("action_target_wall_time_ns")
+                for timing in self.action_timing
             ],
+            "action_target_timestamps_ns": [
+                timing.get("action_target_wall_time_ns")
+                for timing in self.action_timing
+            ],
+            "command_attempts": self.command_attempts,
             "rewards": [0.0] * len(self.actions),
             "camera_info": self.camera_info,
             "success": bool(success),
@@ -941,14 +991,40 @@ class RawEpisodeRecorder:
             "eepose_original_frame": "real-tip",
             "eepose_schema_version": 2,
             "metadata": {
-                "schema": "deoxys_furniturebench_raw_v4_timestamped",
-                "controller_observation_alignment": "observation_before_action",
+                "schema": "deoxys_furniturebench_raw_v5_target_time",
+                "timebase": "unix_epoch_ns",
+                "controller_observation_alignment": (
+                    "raw observation stream plus action target-time master"
+                ),
                 "recording_frequency_hz": self.record_fps,
+                "action_period_ns": int(round(1e9 / self.record_fps)),
+                "episode_grid_start_wall_time_ns": self.action_timing[0].get(
+                    "episode_grid_start_wall_time_ns"
+                ),
                 "recording_includes_noop_actions": True,
                 "timing_contract": (
                     "camera sensor source, PromptDA submit/start/ready, robot/gripper "
                     "state receive, and robot/gripper command send times are stored "
-                    "separately; action_timestamps_ns is the alignment master"
+                    "separately; action_target_timestamps_ns is the alignment "
+                    "master and action_timestamps_ns is its compatibility alias"
+                ),
+                "robot_action_latency_ms": (
+                    self.machine_time_schedule.robot_action_latency_ns / 1e6
+                ),
+                "gripper_action_latency_ms": (
+                    self.machine_time_schedule.gripper_action_latency_ns / 1e6
+                ),
+                "action_stale_guard_ms": (
+                    self.machine_time_schedule.stale_guard_ns / 1e6
+                ),
+                "max_command_lateness_ms": (
+                    self.machine_time_schedule.dispatch_tolerance_ns / 1e6
+                ),
+                "action_latency_source": "estimated",
+                "action_latency_basis": "Deoxys/UMI command_latency=0.01s",
+                "robot_observation_latency_ms": self.robot_observation_latency_ms,
+                "gripper_observation_latency_ms": (
+                    self.gripper_observation_latency_ms
                 ),
                 "parts_poses_frame": "furniture_bench_april_tag",
                 "action_translation_unit": "meter",
@@ -1004,6 +1080,7 @@ class RawEpisodeRecorder:
         self.actions_original = []
         self.actions_absolute = []
         self.action_timing = []
+        self.command_attempts = []
         self.started_at = None
         self.stopped_at = None
         self.state = "idle"
@@ -1153,6 +1230,42 @@ def parse_args():
     parser.add_argument("--record-image-width", type=int, default=320)
     parser.add_argument("--record-image-height", type=int, default=240)
     parser.add_argument("--record-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--robot-action-latency-ms",
+        type=float,
+        default=10.0,
+        help="estimated arm command-to-effect latency used for target-time scheduling",
+    )
+    parser.add_argument(
+        "--gripper-action-latency-ms",
+        type=float,
+        default=10.0,
+        help="estimated gripper command-to-effect latency",
+    )
+    parser.add_argument(
+        "--action-stale-guard-ms",
+        type=float,
+        default=10.0,
+        help="future margin required before accepting a target-time action",
+    )
+    parser.add_argument(
+        "--max-command-lateness-ms",
+        type=float,
+        default=10.0,
+        help="maximum scheduler wake-up lateness before dropping a command",
+    )
+    parser.add_argument(
+        "--robot-observation-latency-ms",
+        type=float,
+        default=0.0,
+        help="estimated robot receive-time correction used by offline alignment",
+    )
+    parser.add_argument(
+        "--gripper-observation-latency-ms",
+        type=float,
+        default=0.0,
+        help="estimated gripper receive-time correction used by offline alignment",
+    )
     # Deprecated compatibility flags. Timestamped v4 recording deliberately
     # keeps every fixed-rate no-op and therefore does not use either value.
     parser.add_argument(
@@ -1210,6 +1323,17 @@ def parse_args():
         parser.error("--data-root is required when DATA_DIR_RAW is not set")
     if args.record_fps <= 0:
         parser.error("--record-fps must be greater than zero")
+    for name in (
+        "robot_action_latency_ms",
+        "gripper_action_latency_ms",
+        "action_stale_guard_ms",
+        "max_command_lateness_ms",
+        "robot_observation_latency_ms",
+        "gripper_observation_latency_ms",
+    ):
+        value = getattr(args, name)
+        if not np.isfinite(value) or value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and non-negative")
     try:
         resolve_eepose_frame(args.eepose_frame)
     except ValueError as exc:
@@ -1306,6 +1430,12 @@ def main():
             annotation_session_factory=annotation_session_factory,
             eepose_frame=args.eepose_frame,
             record_fps=args.record_fps,
+            robot_action_latency_ms=args.robot_action_latency_ms,
+            gripper_action_latency_ms=args.gripper_action_latency_ms,
+            action_stale_guard_ms=args.action_stale_guard_ms,
+            max_command_lateness_ms=args.max_command_lateness_ms,
+            robot_observation_latency_ms=args.robot_observation_latency_ms,
+            gripper_observation_latency_ms=args.gripper_observation_latency_ms,
         )
 
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
@@ -1320,15 +1450,127 @@ def main():
         robot_interface.reset()
         if not wait_for_robot_state(robot_interface):
             raise RuntimeError("robot state was not received")
+        # Warm the controller before an episode so its one-time dummy-message
+        # handshake cannot consume the first target-time action's deadline.
+        robot_interface.control(
+            controller_type=args.controller_type,
+            action=np.array([0.0] * 6 + [-1.0], dtype=np.float64),
+            controller_cfg=controller_cfg,
+            control_gripper=False,
+            enforce_control_frequency=False,
+        )
 
         logger.info(
             "Keys: b=begin, e=end, s=save success, f=save failure, "
             "d=discard, r=reset joints, p=toggle part poses, q=quit"
         )
         record_period = 1.0 / args.record_fps
-        next_record_time = time.monotonic()
+        record_period_ns = int(round(1e9 / args.record_fps))
+        sample_lead_s = max(
+            0.01,
+            episode.machine_time_schedule.common_admission_lead_ns / 1e9
+            - record_period
+            + 0.005,
+        )
+        grid_start_monotonic = None
+        grid_start_wall_time_ns = None
+        grid_index = 0
+        pending_command = None
         draw_part_poses = bool(args.draw_part_poses)
         prompt_depth_error = None
+
+        def cancel_pending_command(reason):
+            nonlocal pending_command
+            if pending_command is None:
+                return
+            timing = dict(pending_command["timing"])
+            timing.update(
+                status="dropped",
+                drop_reason=reason,
+                dropped_wall_time_ns=time.time_ns(),
+            )
+            episode.record_dropped_command(timing)
+            pending_command = None
+
+        def dispatch_pending_command(now_monotonic):
+            nonlocal pending_command
+            if pending_command is None:
+                return
+            schedule = episode.machine_time_schedule
+            target_wall_time_ns = pending_command["target_wall_time_ns"]
+            channels = sorted(
+                ("robot", "gripper"),
+                key=lambda channel: pending_command[f"{channel}_deadline_monotonic"],
+            )
+            for channel in channels:
+                if pending_command[f"{channel}_sent"]:
+                    continue
+                deadline_monotonic = pending_command[
+                    f"{channel}_deadline_monotonic"
+                ]
+                if now_monotonic < deadline_monotonic:
+                    continue
+                dispatch_wall_time_ns = time.time_ns()
+                if schedule.dispatch_expired(
+                    target_wall_time_ns,
+                    dispatch_wall_time_ns,
+                    channel,
+                ):
+                    partial = bool(
+                        pending_command["robot_sent"]
+                        or pending_command["gripper_sent"]
+                    )
+                    timing = dict(pending_command["timing"])
+                    timing.update(
+                        status="partial_dispatch_failure" if partial else "dropped",
+                        drop_reason=f"stale_{channel}_deadline",
+                        dropped_wall_time_ns=dispatch_wall_time_ns,
+                    )
+                    episode.record_dropped_command(timing)
+                    pending_command = None
+                    if partial:
+                        raise RuntimeError(
+                            "coordinated command became stale after one channel sent"
+                        )
+                    return
+                if channel == "robot":
+                    result = robot_interface.control(
+                        controller_type=args.controller_type,
+                        action=pending_command["deoxys_action"].copy(),
+                        controller_cfg=controller_cfg,
+                        control_gripper=False,
+                        enforce_control_frequency=False,
+                    )
+                    send_wall_time_ns = result["robot_command_wall_time_ns"]
+                else:
+                    robot_interface.gripper_control(
+                        float(pending_command["deoxys_action"][-1])
+                    )
+                    send_wall_time_ns = (
+                        robot_interface.last_gripper_command_wall_time_ns
+                    )
+                pending_command[f"{channel}_sent"] = True
+                pending_command["timing"][
+                    f"{channel}_command_wall_time_ns"
+                ] = send_wall_time_ns
+                pending_command["timing"][f"{channel}_send_residual_ms"] = (
+                    send_wall_time_ns - target_wall_time_ns
+                ) / 1e6
+                now_monotonic = time.monotonic()
+
+            if pending_command is not None and all(
+                pending_command[f"{channel}_sent"]
+                for channel in ("robot", "gripper")
+            ):
+                pending_command["timing"]["status"] = "executed"
+                episode.append(
+                    pending_command["observation"],
+                    pending_command["saved_action"],
+                    pending_command["saved_action_original"],
+                    action_absolute=pending_command["saved_action_absolute"],
+                    action_timing=pending_command["timing"],
+                )
+                pending_command = None
 
         with NonBlockingKeyReader() as key_reader:
             running = True
@@ -1420,8 +1662,12 @@ def main():
                                 )
                                 preview_annotation_capture_ns = None
                                 last_annotation_observation = None
-                            next_record_time = time.monotonic()
+                            grid_start_monotonic = time.monotonic()
+                            grid_start_wall_time_ns = time.time_ns()
+                            grid_index = 0
+                            pending_command = None
                     elif key == "e":
+                        cancel_pending_command("operator_stopped_episode")
                         episode.stop(observation)
                     elif key == "s":
                         episode.save(success=True)
@@ -1446,6 +1692,7 @@ def main():
                             preview_annotation_capture_ns = None
                             last_annotation_observation = None
                     elif key == "d":
+                        cancel_pending_command("operator_discarded_episode")
                         episode.discard()
                         if (
                             annotation_session_factory is not None
@@ -1463,6 +1710,7 @@ def main():
                             "enabled" if draw_part_poses else "disabled",
                         )
                     elif key == "q":
+                        cancel_pending_command("operator_quit")
                         running = False
                     elif key == "r":
                         if episode.state == "recording":
@@ -1481,33 +1729,37 @@ def main():
                 if not running:
                     break
 
-                action, _ = input2action(
-                    device=device,
-                    controller_type=args.controller_type,
-                )
-                if action is None:
-                    if episode.state == "recording":
+                now = time.monotonic()
+                if episode.state == "recording":
+                    dispatch_pending_command(now)
+                    cycle_end = grid_start_monotonic + (grid_index + 1) * record_period
+                    sample_time = cycle_end - sample_lead_s
+                    target_monotonic = cycle_end + record_period
+                    if now < sample_time or pending_command is not None:
+                        continue
+                    while now >= sample_time + record_period:
+                        grid_index += 1
+                        cycle_end += record_period
+                        sample_time += record_period
+                        target_monotonic += record_period
+
+                    action, _ = input2action(
+                        device=device,
+                        controller_type=args.controller_type,
+                    )
+                    if action is None:
+                        cancel_pending_command("spacemouse_stop")
                         episode.stop(observation)
                         try:
                             device.start_control(preserve_gripper=True)
                         except TypeError:
                             device.start_control()
                         continue
-                    break
+                    if observation is None:
+                        grid_index += 1
+                        continue
 
-                scaled_action = scaled_deoxys_action(action, controller_cfg)
-                command_timing = robot_interface.control(
-                    controller_type=args.controller_type,
-                    action=np.asarray(action, dtype=np.float64).copy(),
-                    controller_cfg=controller_cfg,
-                )
-
-                now = time.monotonic()
-                if (
-                    episode.state == "recording"
-                    and observation is not None
-                    and now >= next_record_time
-                ):
+                    scaled_action = scaled_deoxys_action(action, controller_cfg)
                     saved_action = deoxys_delta_to_furniture_bench_action(
                         scaled_action,
                         observation["robot_state"]["wrist_pose"],
@@ -1522,31 +1774,72 @@ def main():
                         saved_action,
                         observation["robot_state"],
                     )
-                    episode.append(
-                        observation,
-                        saved_action,
-                        saved_action_original,
-                        action_absolute=saved_action_absolute,
-                        action_timing={
-                            "action_wall_time_ns": command_timing[
-                                "robot_command_wall_time_ns"
-                            ],
-                            "robot_command_wall_time_ns": command_timing[
-                                "robot_command_wall_time_ns"
-                            ],
-                            "gripper_command_wall_time_ns": command_timing[
-                                "gripper_command_wall_time_ns"
-                            ],
-                            "observation_ready_wall_time_ns": observation.get(
-                                "observation_ready_wall_time_ns"
-                            ),
-                        },
+                    target_wall_time_ns = monotonic_target_to_wall_time_ns(
+                        target_monotonic,
+                        monotonic_now_s=grid_start_monotonic,
+                        wall_now_ns=grid_start_wall_time_ns,
                     )
-                    missed_periods = max(
-                        1,
-                        int((now - next_record_time) // record_period) + 1,
-                    )
-                    next_record_time += missed_periods * record_period
+                    generated_wall_time_ns = time.time_ns()
+                    schedule = episode.machine_time_schedule
+                    timing = {
+                        "action_target_wall_time_ns": target_wall_time_ns,
+                        "action_generated_wall_time_ns": generated_wall_time_ns,
+                        "episode_grid_start_wall_time_ns": grid_start_wall_time_ns,
+                        "grid_index": grid_index + 2,
+                        "action_period_ns": record_period_ns,
+                        "robot_command_deadline_wall_time_ns": schedule.deadline_ns(
+                            target_wall_time_ns, "robot"
+                        ),
+                        "gripper_command_deadline_wall_time_ns": schedule.deadline_ns(
+                            target_wall_time_ns, "gripper"
+                        ),
+                        "observation_ready_wall_time_ns": observation.get(
+                            "observation_ready_wall_time_ns"
+                        ),
+                    }
+                    if not schedule.admit(
+                        target_wall_time_ns,
+                        generated_wall_time_ns,
+                    ):
+                        timing.update(
+                            status="dropped",
+                            drop_reason="stale_at_admission",
+                            dropped_wall_time_ns=generated_wall_time_ns,
+                        )
+                        episode.record_dropped_command(timing)
+                        grid_index += 1
+                        continue
+                    pending_command = {
+                        "target_wall_time_ns": target_wall_time_ns,
+                        "robot_deadline_monotonic": target_monotonic
+                        - schedule.robot_action_latency_ns / 1e9,
+                        "gripper_deadline_monotonic": target_monotonic
+                        - schedule.gripper_action_latency_ns / 1e9,
+                        "robot_sent": False,
+                        "gripper_sent": False,
+                        "deoxys_action": np.asarray(
+                            action, dtype=np.float64
+                        ).copy(),
+                        "saved_action": saved_action,
+                        "saved_action_original": saved_action_original,
+                        "saved_action_absolute": saved_action_absolute,
+                        "observation": observation,
+                        "timing": timing,
+                    }
+                    grid_index += 1
+                    continue
+
+                action, _ = input2action(
+                    device=device,
+                    controller_type=args.controller_type,
+                )
+                if action is None:
+                    break
+                robot_interface.control(
+                    controller_type=args.controller_type,
+                    action=np.asarray(action, dtype=np.float64).copy(),
+                    controller_cfg=controller_cfg,
+                )
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
     finally:

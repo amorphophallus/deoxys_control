@@ -433,6 +433,17 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 `480x270@30`、数据记录 `10 Hz`。该组合已在 FrankaControl 当前接线下双相机
 并发实测通过。
 
+录制期间采用 UMI 风格机器时间合同：每个 SpaceMouse 动作先分配固定 Unix wall-time
+target，再分别按 arm/gripper latency 提前发送；已经错过 target/deadline 的动作不会
+发给机器人，也不会进入训练用 `actions`，只会写入 `command_attempts` 审计记录。
+pickle schema 为 `deoxys_furniturebench_raw_v5_target_time`，其中
+`action_target_timestamps_ns` 是唯一主时间轴，`action_timestamps_ns` 只是相同值的
+兼容别名。默认 arm/gripper action latency 和 stale guard 都是基于现有
+`command_latency=0.01s` 的 `10 ms` 初始估计，可用
+`--robot-action-latency-ms`、`--gripper-action-latency-ms` 和
+`--action-stale-guard-ms` 调整；RGB、PromptDA depth 和状态都保留各自的 source/receive
+时间，离线处理时在 action target 上重新匹配/插值。
+
 ### Round-table 数采（默认配置，可直接复制）
 
 先完成 `--target round_table` 的相机与零件初始位置 setup，再运行下面的命令。
@@ -675,3 +686,99 @@ python -m deoxys.examples.process_pickle_prompt_depth \
 
 输出文件名为 `示例_promptda_vitl.pkl`、`示例_promptda_vitl.metrics.json` 和
 `示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与在线方案一致。
+
+## RR 四条件真机 Eval（UMI 机器时间）
+
+以下命令在 FrankaControl 图形桌面终端运行。策略以 front RealSense source time 为
+`T_obs`，action chunk 的目标时间固定为 `T_obs + k * 100 ms`；推理结束时 arm 和
+gripper 使用一次公共 stale-prefix 筛选，再按各自 latency 在 target 前发送。整块过期
+时清空并 hold/requery，不执行 UMI 原代码中“把最后一个 action 重排到下一格”的
+fallback。四个 checkpoint 的旧 Real40 数据属于 `legacy_v2_proxy` 近似对齐，可以
+正常 eval；该 provenance 不会切换或放宽真机 stale-action 规则。
+
+先准备环境变量和公共安全参数。第一次运行应暂时从 `RR_EVAL_ARGS` 删除 `--execute`
+完成 dry-run；确认相机时间域、PromptDA、checkpoint 和状态插值正常后，再恢复
+`--execute`。workspace 数值是当前 one-leg 配置，工作台或机器人基座位置改变后必须
+重新测量。
+
+```shell
+source ~/.bashrc
+conda activate rr-real
+export RR_ROOT=/home/hz/code/robust-rearrangement-custom
+export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
+export CKPT_ROOT=/home/hz/checkpoints/ppu96-real-sim-oneleg-20260828-a
+cd "$RR_ROOT"
+
+RR_EVAL_ARGS=(
+  --interface-cfg "$DEOXYS_ROOT/deoxys/config/charmander.yml"
+  --latency-profile "$RR_ROOT/src/real/latency_profile.estimated_10ms.json"
+  --frequency 10
+  --query-interval-steps 4
+  --max-action-lateness-ms 10
+  --max-wall-time-s 180
+  --workspace-min 0.30 -0.35 0.03
+  --workspace-max 0.75 0.35 0.60
+  --min-ee-z 0.04
+  --prompt-depth-model vitl
+  --prompt-depth-device cuda
+  --execute
+)
+```
+
+下载或复制 checkpoint 后先核对完整 SHA-256：
+
+```shell
+sha256sum \
+  "$CKPT_ROOT/sim400/actor_chkpt_best_val_action_mse_error.pt" \
+  "$CKPT_ROOT/real10-sim400/actor_chkpt_best_val_action_mse_error.pt" \
+  "$CKPT_ROOT/real40/actor_chkpt_best_val_action_mse_error.pt" \
+  "$CKPT_ROOT/real40-sim400/actor_chkpt_best_val_action_mse_error.pt"
+```
+
+期望依次为：
+
+```text
+93a1eb76092ebcde611f8a2a210a7381be5f23efa23c4cb41f4fae49aa342890  sim400
+2d143f0d83c470692ec1f42da149f249334bf6f29ee7e00bd79d36144e59bcaf  real10-sim400
+bdac2baa6ded18714402e7bcf06edcc4d594d8309959ae1273621f48cca6e85e  real40
+fc3b5cc125a4d5f5b7ea6d7c9859411d0f5296e62d9cb40e6a1cd6f4852bbb98  real40-sim400
+```
+
+四个条件分别运行：
+
+```shell
+# sim400
+python -m src.real.evaluate_policy \
+  --checkpoint "$CKPT_ROOT/sim400/actor_chkpt_best_val_action_mse_error.pt" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/sim400.jsonl" \
+  "${RR_EVAL_ARGS[@]}"
+```
+
+```shell
+# real10 + sim400
+python -m src.real.evaluate_policy \
+  --checkpoint "$CKPT_ROOT/real10-sim400/actor_chkpt_best_val_action_mse_error.pt" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real10-sim400.jsonl" \
+  "${RR_EVAL_ARGS[@]}"
+```
+
+```shell
+# real40
+python -m src.real.evaluate_policy \
+  --checkpoint "$CKPT_ROOT/real40/actor_chkpt_best_val_action_mse_error.pt" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real40.jsonl" \
+  "${RR_EVAL_ARGS[@]}"
+```
+
+```shell
+# real40 + sim400
+python -m src.real.evaluate_policy \
+  --checkpoint "$CKPT_ROOT/real40-sim400/actor_chkpt_best_val_action_mse_error.pt" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real40-sim400.jsonl" \
+  "${RR_EVAL_ARGS[@]}"
+```
+
+`latency_profile.estimated_10ms.json` 明确标记为 estimated。日志中的
+`deadline_residual_ms` 用于检查调度线程是否按 deadline 醒来；更换网络路径、控制频率
+或 gripper 配置后应重新估计 action latency，并把 profile 的 `latency_source`、
+`basis`、`measured_at` 一起更新。不得通过增大 lateness 容忍度来执行已经过期的动作。

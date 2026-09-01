@@ -147,6 +147,10 @@ class MeasuredEEVelocityTest(unittest.TestCase):
         robot_interface = MagicMock()
         robot_interface._state_buffer = [state]
         robot_interface.last_gripper_q = np.array([0.04])
+        robot_interface.timestamped_robot_state_buffer.return_value = [
+            {"message": state, "receive_wall_time_ns": 1_000_000_000}
+        ]
+        robot_interface.timestamped_gripper_state_buffer.return_value = []
         observation = build_observation(
             robot_interface,
             camera_sample(),
@@ -448,6 +452,55 @@ class PartPosePreviewTest(unittest.TestCase):
             writer.payload["metadata"]["prompt_depth_anything"],
             prompt_config,
         )
+
+    def test_v5_payload_uses_target_time_and_excludes_dropped_action(self):
+        class CapturingWriter:
+            def submit(self, output_path, payload):
+                self.payload = payload
+
+        writer = CapturingWriter()
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/target-time-test",
+            task_name="one_leg",
+            randomness="low",
+            camera_info={},
+            writer=writer,
+        )
+        initial = camera_sample()
+        initial["parts_pose_valid"][4] = True
+        target_time_ns = 1_700_000_000_200_000_000
+
+        self.assertTrue(recorder.begin(initial))
+        recorder.record_dropped_command(
+            {
+                "action_target_wall_time_ns": target_time_ns - 100_000_000,
+                "status": "dropped",
+                "drop_reason": "stale_at_admission",
+            }
+        )
+        recorder.append(
+            initial,
+            np.zeros(8, dtype=np.float32),
+            action_timing={
+                "action_target_wall_time_ns": target_time_ns,
+                "episode_grid_start_wall_time_ns": target_time_ns - 200_000_000,
+                "robot_command_wall_time_ns": target_time_ns - 10_000_000,
+                "gripper_command_wall_time_ns": target_time_ns - 10_000_000,
+            },
+        )
+        recorder.stop(camera_sample())
+        recorder.save(success=True)
+
+        payload = writer.payload
+        self.assertEqual(
+            payload["metadata"]["schema"],
+            "deoxys_furniturebench_raw_v5_target_time",
+        )
+        self.assertEqual(payload["action_target_timestamps_ns"], [target_time_ns])
+        self.assertEqual(payload["action_timestamps_ns"], [target_time_ns])
+        self.assertEqual(len(payload["actions"]), 1)
+        self.assertEqual(len(payload["command_attempts"]), 2)
+        self.assertEqual(payload["command_attempts"][0]["status"], "dropped")
 
     def test_draws_visible_part_pose_without_mutating_input(self):
         sample = camera_sample(part_z=1.0)

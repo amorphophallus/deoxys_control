@@ -239,6 +239,8 @@ class FrankaInterface:
         action: Union[np.ndarray, list],
         controller_cfg: dict = None,
         termination: bool = False,
+        control_gripper: bool = True,
+        enforce_control_frequency: bool = True,
     ):
         """A function that controls every step on the policy level.
 
@@ -247,11 +249,17 @@ class FrankaInterface:
             action (Union[np.ndarray, list]): The action command for the controller.
             controller_cfg (dict, optional): Controller configuration that corresponds to the first argument`controller_type`. Defaults to None.
             termination (bool, optional): If set True, the control will be terminated. Defaults to False.
+            control_gripper (bool, optional): Publish the action's last element
+                to the gripper.  Set false when arm and gripper have separate
+                machine-time deadlines.  Defaults to True.
+            enforce_control_frequency (bool, optional): Apply the legacy
+                per-call sleep.  External machine-time schedulers set this to
+                false so the command is not delayed twice.  Defaults to True.
         """
         action = np.array(action)
         if self.last_time == None:
             self.last_time = time.time_ns()
-        elif not termination:
+        elif not termination and enforce_control_frequency:
             # Control the policy frequency if not terminated.
             current_time = time.time_ns()
             remaining_time = self._control_interval - (
@@ -496,7 +504,8 @@ class FrankaInterface:
         # target time; callers persist both for latency calibration.
         self.last_robot_command_wall_time_ns = time.time_ns()
 
-        if self.has_gripper:
+        gripper_sent = bool(self.has_gripper and control_gripper)
+        if gripper_sent:
             self.gripper_control(action[self.last_gripper_dim])
 
         if self.use_visualizer and len(self._state_buffer) > 0:
@@ -505,7 +514,7 @@ class FrankaInterface:
         return {
             "robot_command_wall_time_ns": self.last_robot_command_wall_time_ns,
             "gripper_command_wall_time_ns": (
-                self.last_gripper_command_wall_time_ns if self.has_gripper else None
+                self.last_gripper_command_wall_time_ns if gripper_sent else None
             ),
         }
 
