@@ -11,9 +11,11 @@ import time
 import tty
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 from deoxys.franka_interface import FrankaInterface
 from deoxys.utils import transform_utils
@@ -36,9 +38,9 @@ from deoxys.utils.machine_time import (
 )
 from deoxys.utils.prompt_depth_anything import (
     PromptDepthAnythingEstimator,
-    PromptDepthWorker,
     colorize_depth,
     depth_display_bounds,
+    has_usable_depth,
 )
 from deoxys.utils.panda_kinematics import PandaKinematics
 from deoxys.utils.video_utils import H264VideoWriter
@@ -92,6 +94,7 @@ SPACEMOUSE_PRODUCT_IDS = {
     "wired": 50746,  # 0xc63a wired connection
 }
 REAL_ANNOTATION_SOURCE = "real_skill_annotation_util"
+BUFFERED_SCHEMA = "deoxys_furniturebench_raw_v6_offline_buffered"
 REAL_ANNOTATION_OUTPUT_FIELDS = (
     "skill_state",
     "assembly_step",
@@ -108,7 +111,7 @@ RAW_EPISODE_GLOB = "????-??-??T??-??-??.??????.pkl"
 PANDA_KINEMATICS = PandaKinematics()
 
 
-def _create_real_skill_annotation_session(task_name, camera_info):
+def _create_real_skill_annotation_session(task_name, camera_info, mode="online"):
     try:
         from src.eval.real_skill_annotation_util import (
             RealSkillAnnotationSession,
@@ -119,7 +122,7 @@ def _create_real_skill_annotation_session(task_name, camera_info):
             "Run `source ~/.bashrc` and make sure "
             "/home/hz/code/robust-rearrangement-custom is on PYTHONPATH."
         ) from exc
-    return RealSkillAnnotationSession(task_name, camera_info, mode="online")
+    return RealSkillAnnotationSession(task_name, camera_info, mode=mode)
 
 
 def _clear_real_skill_annotation(observation):
@@ -127,6 +130,143 @@ def _clear_real_skill_annotation(observation):
     observation["guidance"] = None
     for key in REAL_ANNOTATION_OUTPUT_FIELDS:
         observation.pop(key, None)
+
+
+def _contains_vlm_metadata(value):
+    if isinstance(value, dict):
+        return any(
+            "vlm" in str(key).lower() or _contains_vlm_metadata(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_vlm_metadata(child) for child in value)
+    return False
+
+
+def _assert_matching_projection(stored, expected, path):
+    if stored is None or expected is None:
+        if stored is not expected:
+            raise RuntimeError(f"{path} nullability disagrees with reprojection")
+        return
+    stored = np.asarray(stored, dtype=np.float64).reshape(-1)
+    expected = np.asarray(expected, dtype=np.float64).reshape(-1)
+    if stored.shape != (2,) or expected.shape != (2,):
+        raise RuntimeError(f"{path} must be a 2-D pixel")
+    if not np.all(np.isfinite(stored)) or not np.allclose(
+        stored, expected, atol=1.0, rtol=0.0
+    ):
+        raise RuntimeError(
+            f"{path} does not match same-frame calibrated reprojection: "
+            f"stored={stored.tolist()} expected={expected.tolist()}"
+        )
+
+
+def validate_buffered_payload(payload, annotation_session):
+    """Fail closed unless a saved v6 episode satisfies its training contract."""
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("buffered payload metadata must be a mapping")
+    expected_top_level = {
+        "env": "FurnitureBench",
+        "annotation_source": "scripted",
+        "image_annotation_mode": "none",
+    }
+    for key, expected in expected_top_level.items():
+        if payload.get(key) != expected:
+            raise RuntimeError(
+                f"buffered payload requires {key}={expected!r}, got "
+                f"{payload.get(key)!r}"
+            )
+    if metadata.get("schema") != BUFFERED_SCHEMA:
+        raise RuntimeError(f"buffered payload requires metadata.schema={BUFFERED_SCHEMA}")
+    if _contains_vlm_metadata(payload):
+        raise RuntimeError("buffered payload must not contain VLM metadata")
+
+    observations = payload.get("observations", [])
+    actions = payload.get("actions", [])
+    timing = payload.get("action_timing", [])
+    target_times = np.asarray(
+        payload.get("action_target_timestamps_ns", []), dtype=np.int64
+    ).reshape(-1)
+    aliases = np.asarray(payload.get("action_timestamps_ns", []), dtype=np.int64).reshape(-1)
+    obs_valid = np.asarray(payload.get("obs_valid", []), dtype=np.bool_).reshape(-1)
+    lengths = {
+        "observations": len(observations),
+        "actions": len(actions),
+        "actions_original": len(payload.get("actions_original", [])),
+        "actions_absolute": len(payload.get("actions_absolute", [])),
+        "action_timing": len(timing),
+        "action_target_timestamps_ns": len(target_times),
+        "action_timestamps_ns": len(aliases),
+        "obs_valid": len(obs_valid),
+        "rewards": len(payload.get("rewards", [])),
+    }
+    frame_count = lengths["actions"]
+    if frame_count == 0 or any(value != frame_count for value in lengths.values()):
+        raise RuntimeError(f"buffered payload arrays must all have N>0 frames: {lengths}")
+    if not np.all(obs_valid):
+        raise RuntimeError("buffered payload requires obs_valid=true on every frame")
+    if not np.array_equal(target_times, aliases):
+        raise RuntimeError("action timestamp compatibility alias differs from master grid")
+    expected_period_ns = int(metadata.get("action_period_ns", 0))
+    if expected_period_ns <= 0 or (
+        frame_count > 1
+        and not np.all(np.abs(np.diff(target_times) - expected_period_ns) <= 1_000)
+    ):
+        raise RuntimeError("action target timestamps are not a continuous fixed-rate grid")
+
+    annotation = metadata.get("real_skill_annotation")
+    if not isinstance(annotation, dict) or not annotation.get("complete"):
+        raise RuntimeError("offline scripted annotation is incomplete")
+    if annotation.get("mode") != "offline":
+        raise RuntimeError("buffered payload requires offline annotation mode")
+    if annotation_session is None:
+        raise RuntimeError("buffered payload requires an annotation session for audit")
+
+    prompt_config = metadata.get("prompt_depth_anything")
+    if not isinstance(prompt_config, dict) or prompt_config.get("online") is not False:
+        raise RuntimeError("buffered payload requires offline PromptDA metadata")
+    prompt_cameras = set(prompt_config.get("cameras", ()))
+    if prompt_cameras != {"front", "wrist"}:
+        raise RuntimeError("buffered payload requires PromptDA on both cameras")
+    for index, (observation, target_ns) in enumerate(zip(observations, target_times)):
+        if int(observation.get("observation_target_wall_time_ns", -1)) != int(target_ns):
+            raise RuntimeError(
+                f"observations[{index}] is not aligned to its action target time"
+            )
+        if observation.get("skill") is None:
+            raise RuntimeError(f"observations[{index}].skill is missing")
+        for camera_name, depth_key in PROMPT_DEPTH_FIELDS.items():
+            if camera_name in prompt_cameras and f"{depth_key}_realsense" not in observation:
+                raise RuntimeError(
+                    f"observations[{index}] is missing preserved raw {depth_key}"
+                )
+
+        point = observation.get("guidance_point_clean")
+        if point is None:
+            point = observation.get("guidance_point")
+        pose = observation.get("guidance_pose_clean")
+        if pose is None:
+            pose = observation.get("guidance_pose")
+        expected_points, _ = annotation_session.annotator._camera_projections(
+            observation,
+            payload["camera_info"],
+            point,
+            pose,
+            observation.get("guidance_gripper_width"),
+        )
+        stored_points = observation.get("guidance_point_2d")
+        if not isinstance(stored_points, dict):
+            raise RuntimeError(f"observations[{index}].guidance_point_2d is missing")
+        for image_key in ("color_image1", "color_image2"):
+            _assert_matching_projection(
+                stored_points.get(image_key),
+                expected_points.get(image_key),
+                f"observations[{index}].guidance_point_2d.{image_key}",
+            )
+
+    return {"frames": frame_count, "period_ns": expected_period_ns}
 
 
 class NonBlockingKeyReader:
@@ -187,6 +327,31 @@ def _gripper_width(robot_interface):
     return float(np.asarray(value).reshape(-1)[0])
 
 
+def _gripper_width_from_record(gripper_record, fallback=float("nan")):
+    if gripper_record is None:
+        return float(fallback)
+    value = _array_field(gripper_record["message"], "width", size=1)
+    return float(value[0]) if np.isfinite(value[0]) else float(fallback)
+
+
+def build_observation_from_records(
+    robot_record,
+    gripper_record,
+    camera_sample,
+    eepose_frame="robot-base",
+    gripper_width_fallback=float("nan"),
+):
+    if robot_record is None or camera_sample is None:
+        return None
+    return _build_observation_from_records_impl(
+        robot_record,
+        gripper_record,
+        camera_sample,
+        eepose_frame,
+        gripper_width_fallback,
+    )
+
+
 def build_observation(robot_interface, camera_sample, eepose_frame="robot-base"):
     if not robot_interface._state_buffer or camera_sample is None:
         return None
@@ -203,6 +368,22 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
     gripper_record = (
         timestamped_gripper_states[-1] if timestamped_gripper_states else None
     )
+    return build_observation_from_records(
+        robot_record,
+        gripper_record,
+        camera_sample,
+        eepose_frame=eepose_frame,
+        gripper_width_fallback=_gripper_width(robot_interface),
+    )
+
+
+def _build_observation_from_records_impl(
+    robot_record,
+    gripper_record,
+    camera_sample,
+    eepose_frame,
+    gripper_width_fallback,
+):
     state = robot_record["message"]
     raw_pose = np.asarray(state.O_T_EE, dtype=np.float64)
     if raw_pose.size != 16:
@@ -276,7 +457,9 @@ def build_observation(robot_interface, camera_sample, eepose_frame="robot-base")
                     "tau_J_d",
                     size=7,
                 ),
-                "gripper_width": _gripper_width(robot_interface),
+                "gripper_width": _gripper_width_from_record(
+                    gripper_record, gripper_width_fallback
+                ),
             },
             "ee_pos_sim": None,
             "ee_quat_sim": None,
@@ -327,6 +510,435 @@ def _camera_sample_with_prompt_depth(prompt_result, cameras):
         "ready_wall_time_ns"
     )
     return sample
+
+
+def _copy_mapping_arrays(value):
+    return {
+        key: item.copy() if isinstance(item, np.ndarray) else item
+        for key, item in value.items()
+    }
+
+
+def _residual_summary(values_ns):
+    values_ms = np.asarray(values_ns, dtype=np.float64) / 1e6
+    if values_ms.size == 0:
+        return {"count": 0}
+    return {
+        "count": int(values_ms.size),
+        "min_ms": float(np.min(values_ms)),
+        "p50_ms": float(np.percentile(values_ms, 50)),
+        "p95_ms": float(np.percentile(values_ms, 95)),
+        "max_ms": float(np.max(values_ms)),
+    }
+
+
+def _nearest_unique_matches(target_times_ns, source_items, max_residual_ns, label):
+    """Greedily match dense, ordered source samples without reusing a frame."""
+
+    ordered = sorted(source_items, key=lambda item: item[0])
+    source_times = np.asarray([item[0] for item in ordered], dtype=np.int64)
+    if not len(source_times):
+        raise RuntimeError(f"{label}: source buffer is empty")
+    if np.any(np.diff(source_times) <= 0):
+        raise RuntimeError(f"{label}: source timestamps are not strictly increasing")
+
+    selected = []
+    residuals = []
+    previous_index = -1
+    for target_time_ns in target_times_ns:
+        insertion = int(np.searchsorted(source_times, int(target_time_ns)))
+        candidates = {
+            max(previous_index + 1, insertion - 1),
+            max(previous_index + 1, insertion),
+        }
+        candidates = [index for index in candidates if index < len(ordered)]
+        if not candidates:
+            raise RuntimeError(f"{label}: no unused source sample remains")
+        index = min(
+            candidates,
+            key=lambda candidate: abs(
+                int(source_times[candidate]) - int(target_time_ns)
+            ),
+        )
+        residual_ns = abs(int(source_times[index]) - int(target_time_ns))
+        if residual_ns > int(max_residual_ns):
+            raise RuntimeError(
+                f"{label}: nearest residual {residual_ns / 1e6:.3f} ms exceeds "
+                f"{max_residual_ns / 1e6:.3f} ms"
+            )
+        selected.append(ordered[index])
+        residuals.append(residual_ns)
+        previous_index = index
+    return selected, residuals
+
+
+def _camera_source_items(camera_samples, camera_name, camera_info):
+    sensor_key = f"{camera_name}_sensor_timestamp_ms"
+    receive_key = f"{camera_name}_receive_wall_time_ns"
+    global_time = bool(camera_info.get(camera_name, {}).get("global_time_enabled"))
+    use_sensor_time = global_time
+    items = []
+    for sample in camera_samples:
+        receive_time_ns = int(sample[receive_key])
+        sensor_time_ms = sample.get(sensor_key)
+        if use_sensor_time:
+            if sensor_time_ms is None or not np.isfinite(sensor_time_ms):
+                use_sensor_time = False
+                break
+            sensor_time_ns = int(round(float(sensor_time_ms) * 1e6))
+            if abs(sensor_time_ns - receive_time_ns) > 5_000_000_000:
+                use_sensor_time = False
+                break
+    source = "realsense_global_time" if use_sensor_time else "receive_wall_time"
+    for sample in camera_samples:
+        source_time_ns = (
+            int(round(float(sample[sensor_key]) * 1e6))
+            if use_sensor_time
+            else int(sample[receive_key])
+        )
+        items.append((source_time_ns, sample))
+    return items, source
+
+
+def _compose_camera_sample(front_match, wrist_match, target_time_ns):
+    front_time_ns, front_sample = front_match
+    wrist_time_ns, wrist_sample = wrist_match
+    combined = _copy_mapping_arrays(front_sample)
+    wrist_keys = (
+        "color_image1",
+        "depth_image1",
+        "wrist_receive_wall_time_ns",
+        "wrist_sensor_timestamp_ms",
+        "wrist_timestamp_domain",
+        "wrist_frame_number",
+    )
+    for key in wrist_keys:
+        value = wrist_sample[key]
+        combined[key] = value.copy() if isinstance(value, np.ndarray) else value
+    combined["front_capture_sequence"] = front_sample.get("capture_sequence")
+    combined["wrist_capture_sequence"] = wrist_sample.get("capture_sequence")
+    combined["camera_alignment_target_wall_time_ns"] = int(target_time_ns)
+    combined["front_alignment_source_wall_time_ns"] = int(front_time_ns)
+    combined["wrist_alignment_source_wall_time_ns"] = int(wrist_time_ns)
+    return combined
+
+
+def _interpolated_robot_record(
+    robot_records,
+    target_time_ns,
+    latency_ns,
+    max_residual_ns,
+):
+    ordered = sorted(
+        robot_records,
+        key=lambda record: int(record["receive_wall_time_ns"]),
+    )
+    effective_times = np.asarray(
+        [int(record["receive_wall_time_ns"]) - int(latency_ns) for record in ordered],
+        dtype=np.int64,
+    )
+    if not len(effective_times):
+        raise RuntimeError("robot_state: source buffer is empty")
+    if np.any(np.diff(effective_times) <= 0):
+        raise RuntimeError("robot_state: timestamps are not strictly increasing")
+
+    target_time_ns = int(target_time_ns)
+    insertion = int(np.searchsorted(effective_times, target_time_ns))
+    if insertion == 0 or insertion == len(ordered):
+        index = 0 if insertion == 0 else len(ordered) - 1
+        residual_ns = abs(int(effective_times[index]) - target_time_ns)
+        if residual_ns > int(max_residual_ns):
+            raise RuntimeError(
+                "robot_state: edge residual "
+                f"{residual_ns / 1e6:.3f} ms exceeds {max_residual_ns / 1e6:.3f} ms"
+            )
+        return ordered[index], {
+            "mode": "nearest_edge",
+            "residual_ns": residual_ns,
+            "source_receive_wall_time_ns": int(
+                ordered[index]["receive_wall_time_ns"]
+            ),
+        }
+
+    left_index = insertion - 1
+    right_index = insertion
+    left_time = int(effective_times[left_index])
+    right_time = int(effective_times[right_index])
+    nearest_residual_ns = min(target_time_ns - left_time, right_time - target_time_ns)
+    if nearest_residual_ns > int(max_residual_ns):
+        raise RuntimeError(
+            "robot_state: bracket residual "
+            f"{nearest_residual_ns / 1e6:.3f} ms exceeds "
+            f"{max_residual_ns / 1e6:.3f} ms"
+        )
+    alpha = (target_time_ns - left_time) / float(right_time - left_time)
+    left_message = ordered[left_index]["message"]
+    right_message = ordered[right_index]["message"]
+    left_pose = np.asarray(left_message.O_T_EE, dtype=np.float64).reshape(4, 4).T
+    right_pose = np.asarray(right_message.O_T_EE, dtype=np.float64).reshape(4, 4).T
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = (1.0 - alpha) * left_pose[:3, 3] + alpha * right_pose[:3, 3]
+    rotations = Rotation.from_matrix(
+        np.stack([left_pose[:3, :3], right_pose[:3, :3]], axis=0)
+    )
+    pose[:3, :3] = Slerp([0.0, 1.0], rotations)([alpha]).as_matrix()[0]
+
+    def interpolate_field(*names, size):
+        left = _array_field(left_message, *names, size=size)
+        right = _array_field(right_message, *names, size=size)
+        return ((1.0 - alpha) * left + alpha * right).tolist()
+
+    left_source_time = _message_time_seconds(left_message)
+    right_source_time = _message_time_seconds(right_message)
+    source_time = None
+    if left_source_time is not None and right_source_time is not None:
+        source_time = (1.0 - alpha) * left_source_time + alpha * right_source_time
+    message = SimpleNamespace(
+        O_T_EE=pose.T.reshape(-1).tolist(),
+        q=interpolate_field("q", size=7),
+        dq=interpolate_field("dq", size=7),
+        tau_J=interpolate_field("tau_J", "tau_J_d", size=7),
+        time=source_time,
+        frame=getattr(left_message, "frame", None),
+    )
+    record = {
+        "message": message,
+        "receive_wall_time_ns": target_time_ns + int(latency_ns),
+    }
+    return record, {
+        "mode": "linear_translation_joint_slerp_rotation",
+        "residual_ns": int(nearest_residual_ns),
+        "left_receive_wall_time_ns": int(
+            ordered[left_index]["receive_wall_time_ns"]
+        ),
+        "right_receive_wall_time_ns": int(
+            ordered[right_index]["receive_wall_time_ns"]
+        ),
+        "alpha": float(alpha),
+    }
+
+
+def materialize_buffered_episode(
+    action_records,
+    camera_samples,
+    robot_records,
+    gripper_records,
+    *,
+    camera_info,
+    eepose_frame,
+    action_period_ns,
+    camera_max_residual_ns,
+    camera_pair_max_skew_ns,
+    robot_max_residual_ns,
+    gripper_max_residual_ns,
+    robot_latency_ns=0,
+    gripper_latency_ns=0,
+):
+    """Screen and reorder raw timestamp buffers onto the action target grid."""
+
+    ordered_actions = sorted(
+        action_records,
+        key=lambda record: int(record["timing"]["action_target_wall_time_ns"]),
+    )
+    if not ordered_actions:
+        raise RuntimeError("no executed actions were buffered")
+    target_times = np.asarray(
+        [
+            int(record["timing"]["action_target_wall_time_ns"])
+            for record in ordered_actions
+        ],
+        dtype=np.int64,
+    )
+    target_intervals = np.diff(target_times)
+    if np.any(np.abs(target_intervals - int(action_period_ns)) > 1_000):
+        raise RuntimeError(
+            "action target grid is discontinuous: expected "
+            f"{action_period_ns / 1e6:.3f} ms, got "
+            f"{(target_intervals / 1e6).tolist()}"
+        )
+
+    front_items, front_time_source = _camera_source_items(
+        camera_samples, "front", camera_info
+    )
+    wrist_items, wrist_time_source = _camera_source_items(
+        camera_samples, "wrist", camera_info
+    )
+    front_matches, front_residuals = _nearest_unique_matches(
+        target_times,
+        front_items,
+        camera_max_residual_ns,
+        "front_camera",
+    )
+    wrist_matches, wrist_residuals = _nearest_unique_matches(
+        target_times,
+        wrist_items,
+        camera_max_residual_ns,
+        "wrist_camera",
+    )
+    pair_skews = [
+        abs(int(front[0]) - int(wrist[0]))
+        for front, wrist in zip(front_matches, wrist_matches)
+    ]
+    if pair_skews and max(pair_skews) > int(camera_pair_max_skew_ns):
+        raise RuntimeError(
+            "front/wrist pair skew "
+            f"{max(pair_skews) / 1e6:.3f} ms exceeds "
+            f"{camera_pair_max_skew_ns / 1e6:.3f} ms"
+        )
+
+    gripper_items = [
+        (
+            int(record["receive_wall_time_ns"]) - int(gripper_latency_ns),
+            record,
+        )
+        for record in gripper_records
+    ]
+    gripper_matches, gripper_residuals = _nearest_unique_matches(
+        target_times,
+        gripper_items,
+        gripper_max_residual_ns,
+        "gripper_state",
+    )
+
+    observations = []
+    actions = []
+    actions_original = []
+    actions_absolute = []
+    action_timing = []
+    robot_residuals = []
+    for index, (record, front_match, wrist_match, gripper_match) in enumerate(
+        zip(ordered_actions, front_matches, wrist_matches, gripper_matches)
+    ):
+        target_time_ns = int(target_times[index])
+        robot_record, robot_match = _interpolated_robot_record(
+            robot_records,
+            target_time_ns,
+            robot_latency_ns,
+            robot_max_residual_ns,
+        )
+        robot_residuals.append(robot_match["residual_ns"])
+        camera_sample = _compose_camera_sample(
+            front_match,
+            wrist_match,
+            target_time_ns,
+        )
+        gripper_record = gripper_match[1]
+        observation = build_observation_from_records(
+            robot_record,
+            gripper_record,
+            camera_sample,
+            eepose_frame=eepose_frame,
+        )
+        if observation is None:
+            raise RuntimeError(f"could not build aligned observation {index}")
+        observation["control_wall_time_ns"] = target_time_ns
+        observation["observation_target_wall_time_ns"] = target_time_ns
+        observation["offline_alignment"] = {
+            "front_residual_ms": front_residuals[index] / 1e6,
+            "wrist_residual_ms": wrist_residuals[index] / 1e6,
+            "front_wrist_skew_ms": pair_skews[index] / 1e6,
+            "gripper_residual_ms": gripper_residuals[index] / 1e6,
+            "robot_state": robot_match,
+        }
+        scaled_action = np.asarray(record["scaled_action"], dtype=np.float64)
+        action = deoxys_delta_to_furniture_bench_action(
+            scaled_action,
+            observation["robot_state"]["wrist_pose"],
+            eepose_frame,
+        )
+        action_original = deoxys_delta_to_furniture_bench_action(
+            scaled_action,
+            observation["robot_state"]["wrist_pose"],
+            "original",
+        )
+        observations.append(observation)
+        actions.append(np.asarray(action, dtype=np.float32))
+        actions_original.append(np.asarray(action_original, dtype=np.float32))
+        actions_absolute.append(delta_action_to_absolute(action, observation["robot_state"]))
+        timing = dict(record["timing"])
+        timing["offline_alignment_index"] = index
+        action_timing.append(timing)
+
+    report = {
+        "mode": "offline_target_time_buffered",
+        "num_buffered_camera_pairs": len(camera_samples),
+        "num_buffered_robot_states": len(robot_records),
+        "num_buffered_gripper_states": len(gripper_records),
+        "num_materialized_steps": len(observations),
+        "target_interval": _residual_summary(target_intervals),
+        "front_time_source": front_time_source,
+        "wrist_time_source": wrist_time_source,
+        "front_residual": _residual_summary(front_residuals),
+        "wrist_residual": _residual_summary(wrist_residuals),
+        "front_wrist_skew": _residual_summary(pair_skews),
+        "robot_residual": _residual_summary(robot_residuals),
+        "gripper_residual": _residual_summary(gripper_residuals),
+    }
+    return {
+        "observations": observations,
+        "actions": actions,
+        "actions_original": actions_original,
+        "actions_absolute": actions_absolute,
+        "action_timing": action_timing,
+        "report": report,
+    }
+
+
+def apply_prompt_depth_offline(observations, estimator, cameras):
+    """Enhance every selected observation after target-time materialization."""
+
+    if estimator is None:
+        return {"enabled": False, "frame_count": 0, "inference_ms": 0.0}
+    camera_fields = {
+        "wrist": ("color_image1", "depth_image1"),
+        "front": ("color_image2", "depth_image2"),
+    }
+    last_usable_depth = {}
+    total_inference_ms = 0.0
+    for frame_index, observation in enumerate(observations):
+        frame_stats = {}
+        started_wall_time_ns = time.time_ns()
+        for camera_name in cameras:
+            color_key, depth_key = camera_fields[camera_name]
+            raw_depth = np.asarray(observation[depth_key]).copy()
+            prompt_depth = None
+            if has_usable_depth(
+                raw_depth,
+                estimator.min_depth_m,
+                estimator.max_depth_m,
+            ):
+                last_usable_depth[camera_name] = raw_depth
+            else:
+                prompt_depth = last_usable_depth.get(camera_name)
+            enhanced, stats = estimator.enhance(
+                observation[color_key],
+                raw_depth,
+                prompt_depth_m=prompt_depth,
+            )
+            if enhanced.shape != raw_depth.shape:
+                raise RuntimeError(
+                    f"PromptDA frame {frame_index} {depth_key} shape mismatch: "
+                    f"{enhanced.shape} vs {raw_depth.shape}"
+                )
+            observation[f"{depth_key}_realsense"] = raw_depth
+            observation[depth_key] = enhanced.astype(np.float16)
+            frame_stats[camera_name] = dict(stats)
+            total_inference_ms += float(stats.get("inference_ms", 0.0))
+        observation["prompt_depth_started_wall_time_ns"] = started_wall_time_ns
+        observation["prompt_depth_ready_wall_time_ns"] = time.time_ns()
+        observation["prompt_depth_stats"] = frame_stats
+        if (frame_index + 1) % 25 == 0 or frame_index + 1 == len(observations):
+            logger.info(
+                "Offline PromptDA processed %d/%d selected frames",
+                frame_index + 1,
+                len(observations),
+            )
+    return {
+        "enabled": True,
+        "frame_count": len(observations),
+        "camera_inference_count": len(observations) * len(tuple(cameras)),
+        "inference_ms": total_inference_ms,
+    }
 
 
 def _record_intrinsics_matrix(record_intrinsics):
@@ -761,10 +1373,19 @@ class RawEpisodeRecorder:
         max_command_lateness_ms=10.0,
         robot_observation_latency_ms=0.0,
         gripper_observation_latency_ms=0.0,
+        output_suffix=None,
+        annotation_source="scripted",
     ):
         self.data_root = Path(data_root).expanduser().resolve()
         self.task_name = task_name
         self.randomness = randomness
+        if annotation_source != "scripted":
+            raise ValueError("annotation_source must be scripted")
+        output_suffix = str(output_suffix or "").strip()
+        if not output_suffix or Path(output_suffix).name != output_suffix:
+            raise ValueError("output_suffix must be one nonempty path component")
+        self.output_suffix = output_suffix
+        self.annotation_source = annotation_source
         self.camera_info = camera_info
         self.writer = writer
         self.prompt_depth_config = prompt_depth_config
@@ -800,6 +1421,15 @@ class RawEpisodeRecorder:
         self.state = "idle"
         self.last_recorded_gripper = None
         self.gripper_hold_remaining = 0
+        self.buffered_mode = False
+        self.buffered_actions = []
+        self.camera_samples = []
+        self.camera_start_sequence = None
+        self.robot_start_index = None
+        self.gripper_start_index = None
+        self.buffer_error = None
+        self.buffer_alignment_report = None
+        self.prompt_depth_report = None
 
     def _parts_ready(self, observation):
         if observation is None:
@@ -852,9 +1482,117 @@ class RawEpisodeRecorder:
         self.gripper_hold_remaining = 0
         self.annotation_session = annotation_session
         self.annotation_error = None
+        self.buffered_mode = False
+        self.buffered_actions = []
+        self.camera_samples = []
+        self.buffer_error = None
+        self.buffer_alignment_report = None
+        self.prompt_depth_report = None
         self.state = "recording"
         logger.info("Recording started")
         return True
+
+    def begin_buffered(
+        self,
+        initial_observation,
+        *,
+        camera_start_sequence,
+        robot_start_index,
+        gripper_start_index,
+    ):
+        """Start a raw-buffer episode without online depth/annotation work."""
+
+        if self.state == "recording":
+            logger.warning("An episode is already recording")
+            return False
+        if self.state == "pending_save":
+            logger.warning("Save or discard the previous episode first")
+            return False
+        if not self._parts_ready(initial_observation):
+            required_parts = ", ".join(TASK_PART_NAMES[self.task_name].values())
+            logger.warning(
+                "Recording not started: required %s poses have not all been detected",
+                required_parts,
+            )
+            return False
+        self.observations = []
+        self.actions = []
+        self.actions_original = []
+        self.actions_absolute = []
+        self.action_timing = []
+        self.command_attempts = []
+        self.buffered_actions = []
+        self.camera_samples = []
+        self.camera_start_sequence = int(camera_start_sequence)
+        self.robot_start_index = max(0, int(robot_start_index) - 2)
+        self.gripper_start_index = max(0, int(gripper_start_index) - 2)
+        self.buffer_error = None
+        self.buffer_alignment_report = None
+        self.prompt_depth_report = None
+        self.started_at = datetime.now().isoformat(timespec="milliseconds")
+        self.stopped_at = None
+        self.last_recorded_gripper = None
+        self.gripper_hold_remaining = 0
+        self.annotation_session = None
+        self.annotation_error = None
+        self.buffered_mode = True
+        self.state = "recording"
+        logger.info(
+            "Buffered recording started at camera sequence %d; PromptDA and "
+            "annotation are deferred until end",
+            self.camera_start_sequence,
+        )
+        return True
+
+    def add_camera_samples(self, samples):
+        if self.state != "recording" or not self.buffered_mode:
+            return
+        for sample in samples:
+            sequence = int(sample["capture_sequence"])
+            if self.camera_samples:
+                previous = int(self.camera_samples[-1]["capture_sequence"])
+                if sequence <= previous:
+                    self.mark_buffer_error(
+                        f"camera capture sequence is not increasing: {previous}, {sequence}"
+                    )
+                    continue
+                if sequence != previous + 1:
+                    self.mark_buffer_error(
+                        f"camera capture buffer lost sequences {previous + 1}..{sequence - 1}"
+                    )
+            self.camera_samples.append(_copy_mapping_arrays(sample))
+
+    def append_buffered(self, scaled_action, *, action_timing):
+        if self.state != "recording" or not self.buffered_mode:
+            return
+        timing = dict(action_timing or {})
+        timing.setdefault("status", "executed")
+        target_time_ns = timing.get("action_target_wall_time_ns")
+        if target_time_ns is None:
+            self.mark_buffer_error("executed action is missing its target timestamp")
+            return
+        if self.buffered_actions:
+            previous_time_ns = int(
+                self.buffered_actions[-1]["timing"]["action_target_wall_time_ns"]
+            )
+            expected_period_ns = int(round(1e9 / self.record_fps))
+            actual_period_ns = int(target_time_ns) - previous_time_ns
+            if abs(actual_period_ns - expected_period_ns) > 1_000:
+                self.mark_buffer_error(
+                    "executed action target grid is discontinuous: "
+                    f"{actual_period_ns / 1e6:.3f} ms"
+                )
+        record = {
+            "scaled_action": np.asarray(scaled_action, dtype=np.float64).copy(),
+            "timing": timing,
+        }
+        self.buffered_actions.append(record)
+        self.command_attempts.append(dict(timing))
+
+    def mark_buffer_error(self, reason):
+        if self.buffer_error is None:
+            self.buffer_error = str(reason)
+            logger.error("Current buffered episode is invalid: %s", self.buffer_error)
 
     def should_record(self, action, no_op_threshold, gripper_hold_frames):
         gripper = float(np.sign(action[-1]))
@@ -911,7 +1649,7 @@ class RawEpisodeRecorder:
             self.gripper_hold_remaining -= 1
         self.last_recorded_gripper = gripper
 
-    def record_dropped_command(self, timing):
+    def record_dropped_command(self, timing, invalidate_continuity=True):
         """Keep a stale/failed command in audit metadata, never in training arrays."""
 
         if self.state != "recording":
@@ -919,6 +1657,11 @@ class RawEpisodeRecorder:
         attempt = dict(timing)
         attempt.setdefault("status", "dropped")
         self.command_attempts.append(attempt)
+        if self.buffered_mode and invalidate_continuity:
+            self.mark_buffer_error(
+                "action grid contains a non-executed command: "
+                f"{attempt.get('drop_reason', attempt.get('status'))}"
+            )
 
     def stop(self, final_observation):
         if self.state != "recording":
@@ -937,6 +1680,105 @@ class RawEpisodeRecorder:
             len(self.actions),
         )
 
+    def stop_buffered(
+        self,
+        robot_records,
+        gripper_records,
+        *,
+        prompt_depth_estimator,
+        prompt_depth_cameras,
+        camera_max_residual_ms,
+        camera_pair_max_skew_ms,
+        robot_max_residual_ms,
+        gripper_max_residual_ms,
+    ):
+        if self.state != "recording" or not self.buffered_mode:
+            logger.warning("No buffered episode is recording")
+            return False
+        self.stopped_at = datetime.now().isoformat(timespec="milliseconds")
+        self.state = "pending_save"
+        if self.buffer_error is not None:
+            logger.error(
+                "Buffered episode stopped invalid and cannot be saved: %s",
+                self.buffer_error,
+            )
+            return False
+        try:
+            materialized = materialize_buffered_episode(
+                self.buffered_actions,
+                self.camera_samples,
+                robot_records[self.robot_start_index :],
+                gripper_records[self.gripper_start_index :],
+                camera_info=self.camera_info,
+                eepose_frame=self.eepose_frame,
+                action_period_ns=int(round(1e9 / self.record_fps)),
+                camera_max_residual_ns=int(round(camera_max_residual_ms * 1e6)),
+                camera_pair_max_skew_ns=int(
+                    round(camera_pair_max_skew_ms * 1e6)
+                ),
+                robot_max_residual_ns=int(round(robot_max_residual_ms * 1e6)),
+                gripper_max_residual_ns=int(
+                    round(gripper_max_residual_ms * 1e6)
+                ),
+                robot_latency_ns=int(
+                    round(self.robot_observation_latency_ms * 1e6)
+                ),
+                gripper_latency_ns=int(
+                    round(self.gripper_observation_latency_ms * 1e6)
+                ),
+            )
+            self.observations = materialized["observations"]
+            self.actions = materialized["actions"]
+            self.actions_original = materialized["actions_original"]
+            self.actions_absolute = materialized["actions_absolute"]
+            self.action_timing = materialized["action_timing"]
+            self.buffer_alignment_report = materialized["report"]
+            invalid_pose_frames = [
+                index
+                for index, observation in enumerate(self.observations)
+                if not self._parts_ready(observation)
+            ]
+            if invalid_pose_frames:
+                raise RuntimeError(
+                    "required geometry is invalid after alignment at frames "
+                    f"{invalid_pose_frames[:20]}"
+                )
+            self.prompt_depth_report = apply_prompt_depth_offline(
+                self.observations,
+                prompt_depth_estimator,
+                prompt_depth_cameras,
+            )
+            if self.annotation_session_factory is not None:
+                self.annotation_session = self.annotation_session_factory(
+                    self.task_name,
+                    self.camera_info,
+                    mode="offline",
+                )
+                for index, observation in enumerate(self.observations):
+                    self.annotation_session.annotate_observation(observation)
+                    if (index + 1) % 50 == 0 or index + 1 == len(self.observations):
+                        logger.info(
+                            "Offline geometry annotation processed %d/%d frames",
+                            index + 1,
+                            len(self.observations),
+                        )
+        except Exception as exc:
+            self.annotation_error = f"{type(exc).__name__}: {exc}"
+            self.annotation_session = None
+            for observation in self.observations:
+                _clear_real_skill_annotation(observation)
+            self.mark_buffer_error(self.annotation_error)
+            logger.exception(
+                "Buffered episode materialization failed; save is disabled"
+            )
+            return False
+        logger.info(
+            "Buffered recording materialized with %d continuous actions. "
+            "Press s=success, f=failure, d=discard",
+            len(self.actions),
+        )
+        return True
+
     def _output_path(self, outcome):
         output_dir = (
             self.data_root
@@ -946,6 +1788,7 @@ class RawEpisodeRecorder:
             / self.task_name
             / "teleop"
             / self.randomness
+            / self.output_suffix
             / outcome
         )
         timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")
@@ -955,18 +1798,31 @@ class RawEpisodeRecorder:
         if self.state != "pending_save":
             logger.warning("There is no stopped episode waiting to be saved")
             return None
+        if self.buffer_error is not None:
+            logger.error(
+                "Refusing to save invalid buffered episode: %s. Press d to discard.",
+                self.buffer_error,
+            )
+            return None
         if not self.actions:
             logger.warning("The episode contains no action; discarding it")
             self.discard()
             return None
-        if len(self.observations) != len(self.actions) + 1:
+        valid_observation_lengths = (
+            {len(self.actions)}
+            if self.buffered_mode
+            else {len(self.actions), len(self.actions) + 1}
+        )
+        if len(self.observations) not in valid_observation_lengths:
             raise RuntimeError(
-                "raw episode must contain N+1 observations and N actions"
+                "buffered episodes require N observations/N actions; legacy "
+                "episodes may contain N or N+1 observations"
             )
 
         outcome = "success" if success else "failure"
         output_path = self._output_path(outcome)
         payload = {
+            "env": "FurnitureBench",
             "observations": self.observations,
             "actions": self.actions,
             "actions_original": self.actions_original,
@@ -983,6 +1839,9 @@ class RawEpisodeRecorder:
             "command_attempts": self.command_attempts,
             "rewards": [0.0] * len(self.actions),
             "camera_info": self.camera_info,
+            "annotation_source": self.annotation_source,
+            "image_annotation_mode": "none",
+            "obs_valid": np.ones(len(self.actions), dtype=np.bool_),
             "success": bool(success),
             "task": self.task_name,
             "furniture": self.task_name,
@@ -991,10 +1850,16 @@ class RawEpisodeRecorder:
             "eepose_original_frame": "real-tip",
             "eepose_schema_version": 2,
             "metadata": {
-                "schema": "deoxys_furniturebench_raw_v5_target_time",
+                "schema": (
+                    BUFFERED_SCHEMA
+                    if self.buffered_mode
+                    else "deoxys_furniturebench_raw_v5_target_time"
+                ),
                 "timebase": "unix_epoch_ns",
                 "controller_observation_alignment": (
-                    "raw observation stream plus action target-time master"
+                    "offline screened/reordered action target-time grid"
+                    if self.buffered_mode
+                    else "raw observation stream plus action target-time master"
                 ),
                 "recording_frequency_hz": self.record_fps,
                 "action_period_ns": int(round(1e9 / self.record_fps)),
@@ -1003,10 +1868,15 @@ class RawEpisodeRecorder:
                 ),
                 "recording_includes_noop_actions": True,
                 "timing_contract": (
-                    "camera sensor source, PromptDA submit/start/ready, robot/gripper "
-                    "state receive, and robot/gripper command send times are stored "
-                    "separately; action_target_timestamps_ns is the alignment "
-                    "master and action_timestamps_ns is its compatibility alias"
+                    "camera source, robot/gripper receive, and command send times "
+                    "are buffered separately; action_target_timestamps_ns is the "
+                    "master grid; PromptDA and geometry annotation run only after "
+                    "screening and reordering"
+                    if self.buffered_mode
+                    else "camera sensor source, PromptDA submit/start/ready, "
+                    "robot/gripper state receive, and robot/gripper command send "
+                    "times are stored separately; action_target_timestamps_ns is "
+                    "the alignment master"
                 ),
                 "robot_action_latency_ms": (
                     self.machine_time_schedule.robot_action_latency_ns / 1e6
@@ -1051,15 +1921,26 @@ class RawEpisodeRecorder:
                 ),
                 "action_original_frame": "robot-base/real-tip",
                 "randomness": self.randomness,
+                "output_suffix": self.output_suffix,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "num_observations": len(self.observations),
                 "num_actions": len(self.actions),
                 "prompt_depth_anything": self.prompt_depth_config,
+                "offline_buffer_alignment": self.buffer_alignment_report,
+                "offline_prompt_depth_report": self.prompt_depth_report,
             },
         }
         if self.annotation_session is not None:
             self.annotation_session.update_trajectory_metadata(payload)
+            if self.buffered_mode:
+                payload["metadata"]["annotation_provenance"] = {
+                    "source": "scripted",
+                    "implementation": REAL_ANNOTATION_SOURCE,
+                    "stage": "after_target_time_selection",
+                    "rgb_pixels_modified": False,
+                }
+                payload["annotation_source"] = self.annotation_source
         elif self.annotation_session_factory is not None:
             for observation in payload["observations"]:
                 _clear_real_skill_annotation(observation)
@@ -1069,6 +1950,18 @@ class RawEpisodeRecorder:
                 "complete": False,
                 "error": self.annotation_error,
             }
+        if self.buffered_mode:
+            try:
+                audit = validate_buffered_payload(payload, self.annotation_session)
+            except Exception as exc:
+                self.mark_buffer_error(
+                    f"save contract audit failed: {type(exc).__name__}: {exc}"
+                )
+                logger.exception(
+                    "Buffered episode failed its save contract; press d to discard"
+                )
+                return None
+            payload["metadata"]["buffered_contract_audit"] = audit
         self.writer.submit(output_path, payload)
         self.discard(log=False)
         return output_path
@@ -1088,6 +1981,15 @@ class RawEpisodeRecorder:
         self.gripper_hold_remaining = 0
         self.annotation_session = None
         self.annotation_error = None
+        self.buffered_mode = False
+        self.buffered_actions = []
+        self.camera_samples = []
+        self.camera_start_sequence = None
+        self.robot_start_index = None
+        self.gripper_start_index = None
+        self.buffer_error = None
+        self.buffer_alignment_report = None
+        self.prompt_depth_report = None
         if log:
             logger.info("Discarded episode with %d actions", action_count)
 
@@ -1174,8 +2076,11 @@ def delta_action_to_absolute(action, robot_state):
 
 def parse_args():
     default_data_root = os.environ.get("DATA_DIR_RAW")
+    default_interface_cfg = (
+        Path(__file__).resolve().parents[1] / "config" / "charmander.yml"
+    )
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interface-cfg", default="config/charmander.yml")
+    parser.add_argument("--interface-cfg", default=str(default_interface_cfg))
     parser.add_argument("--controller-type", default="OSC_POSE")
     parser.add_argument(
         "--eepose-frame",
@@ -1198,6 +2103,17 @@ def parse_args():
         help="override the product ID selected by --spacemouse-connection",
     )
     parser.add_argument("--data-root", default=default_data_root)
+    parser.add_argument(
+        "--annotation-source",
+        choices=("scripted",),
+        required=True,
+        help="required policy-target provenance; only scripted geometry is accepted",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        required=True,
+        help="new campaign directory name under teleop/<randomness>",
+    )
     parser.add_argument(
         "--task-name",
         choices=tuple(TASK_PART_NAMES),
@@ -1266,6 +2182,30 @@ def parse_args():
         default=0.0,
         help="estimated gripper receive-time correction used by offline alignment",
     )
+    parser.add_argument(
+        "--camera-match-max-residual-ms",
+        type=float,
+        default=45.0,
+        help="maximum per-camera residual during final target-time matching",
+    )
+    parser.add_argument(
+        "--camera-pair-max-skew-ms",
+        type=float,
+        default=40.0,
+        help="maximum front/wrist source-time skew after final matching",
+    )
+    parser.add_argument(
+        "--robot-state-max-residual-ms",
+        type=float,
+        default=20.0,
+        help="maximum nearest robot-state residual around an interpolation target",
+    )
+    parser.add_argument(
+        "--gripper-state-max-residual-ms",
+        type=float,
+        default=60.0,
+        help="maximum gripper-state residual during final target-time matching",
+    )
     # Deprecated compatibility flags. Timestamped v4 recording deliberately
     # keeps every fixed-rate no-op and therefore does not use either value.
     parser.add_argument(
@@ -1280,8 +2220,8 @@ def parse_args():
         "--real-skill-annotation",
         action="store_true",
         help=(
-            "run the robust-rearrangement one_leg annotator online, draw its "
-            "skill/guidance point, and save annotations in the pickle"
+            "preview the robust-rearrangement one_leg annotator live, then "
+            "recompute every saved skill/guidance annotation offline"
         ),
     )
     parser.add_argument("--no-camera-preview", action="store_true")
@@ -1289,8 +2229,8 @@ def parse_args():
         "--prompt-depth-anything",
         action="store_true",
         help=(
-            "enhance recorded depth in a background thread and show "
-            "RGB/raw/enhanced depth"
+            "run PromptDA offline on every target-time-selected frame after "
+            "the operator ends an episode"
         ),
     )
     parser.add_argument(
@@ -1321,6 +2261,17 @@ def parse_args():
         args.product_id = SPACEMOUSE_PRODUCT_IDS[args.spacemouse_connection]
     if not args.data_root:
         parser.error("--data-root is required when DATA_DIR_RAW is not set")
+    if Path(args.output_suffix).name != args.output_suffix or not args.output_suffix.strip():
+        parser.error("--output-suffix must be one nonempty path component")
+    interface_cfg = Path(args.interface_cfg).expanduser()
+    if not interface_cfg.is_absolute():
+        interface_cfg = Path.cwd() / interface_cfg
+    if not interface_cfg.is_file():
+        parser.error(
+            f"--interface-cfg does not exist: {interface_cfg}. "
+            "Use an absolute path or run from the Deoxys checkout directory."
+        )
+    args.interface_cfg = str(interface_cfg.resolve())
     if args.record_fps <= 0:
         parser.error("--record-fps must be greater than zero")
     for name in (
@@ -1330,6 +2281,10 @@ def parse_args():
         "max_command_lateness_ms",
         "robot_observation_latency_ms",
         "gripper_observation_latency_ms",
+        "camera_match_max_residual_ms",
+        "camera_pair_max_skew_ms",
+        "robot_state_max_residual_ms",
+        "gripper_state_max_residual_ms",
     ):
         value = getattr(args, name)
         if not np.isfinite(value) or value < 0:
@@ -1348,7 +2303,7 @@ def parse_args():
 def main():
     args = parse_args()
     camera = None
-    prompt_depth_worker = None
+    prompt_depth_estimator = None
     prompt_depth_cameras = ()
     prompt_depth_config = None
     annotation_session_factory = None
@@ -1364,7 +2319,14 @@ def main():
     device = None
     robot_interface = None
     controller_cfg = None
+    startup_stage = "dual_realsense_initialization"
     try:
+        logger.info(
+            "Startup stage=%s interface_cfg=%s data_root=%s",
+            startup_stage,
+            args.interface_cfg,
+            args.data_root,
+        )
         camera = DualRealSenseSnapshotter(
             front_serial=args.front_camera_serial,
             wrist_serial=args.wrist_camera_serial,
@@ -1386,31 +2348,31 @@ def main():
         )
         camera.start()
         camera_info = camera.metadata()
+        logger.info("Startup stage=dual_realsense_ready")
+        startup_stage = "real_skill_annotation_initialization"
         if args.real_skill_annotation:
             annotation_session_factory = _create_real_skill_annotation_session
             if not args.no_camera_preview:
                 preview_annotation_session = annotation_session_factory(
                     args.task_name, camera_info
                 )
+        startup_stage = "prompt_depth_initialization"
         if args.prompt_depth_anything:
             prompt_depth_cameras = (
                 ("wrist", "front")
                 if args.prompt_depth_cameras == "both"
                 else (args.prompt_depth_cameras,)
             )
-            prompt_depth_worker = PromptDepthWorker(
-                PromptDepthAnythingEstimator(
-                    model=args.prompt_depth_model,
-                    device=args.prompt_depth_device,
-                    max_size=args.prompt_depth_max_size,
-                    min_depth_m=args.prompt_depth_min_m,
-                    max_depth_m=args.prompt_depth_max_m,
-                ),
-                cameras=prompt_depth_cameras,
+            prompt_depth_estimator = PromptDepthAnythingEstimator(
+                model=args.prompt_depth_model,
+                device=args.prompt_depth_device,
+                max_size=args.prompt_depth_max_size,
+                min_depth_m=args.prompt_depth_min_m,
+                max_depth_m=args.prompt_depth_max_m,
             )
-            prompt_depth_worker.start()
             prompt_depth_config = {
-                "online": True,
+                "online": False,
+                "stage": "after_target_time_selection",
                 "model": args.prompt_depth_model,
                 "max_size": args.prompt_depth_max_size,
                 "prompt_size": [256, 192],
@@ -1420,6 +2382,7 @@ def main():
                 ],
                 "original_depth_suffix": "_realsense",
             }
+        startup_stage = "episode_recorder_initialization"
         episode = RawEpisodeRecorder(
             data_root=args.data_root,
             task_name=args.task_name,
@@ -1436,10 +2399,21 @@ def main():
             max_command_lateness_ms=args.max_command_lateness_ms,
             robot_observation_latency_ms=args.robot_observation_latency_ms,
             gripper_observation_latency_ms=args.gripper_observation_latency_ms,
+            output_suffix=args.output_suffix,
+            annotation_source=args.annotation_source,
         )
 
+        startup_stage = "spacemouse_initialization"
+        logger.info(
+            "Startup stage=%s vendor_id=%s product_id=%s",
+            startup_stage,
+            args.vendor_id,
+            args.product_id,
+        )
         device = SpaceMouse(vendor_id=args.vendor_id, product_id=args.product_id)
         device.start_control()
+        startup_stage = "franka_interface_initialization"
+        logger.info("Startup stage=%s", startup_stage)
         robot_interface = FrankaInterface(
             args.interface_cfg,
             control_freq=args.record_fps,
@@ -1448,10 +2422,14 @@ def main():
         controller_cfg = get_default_controller_config(args.controller_type)
         joint_controller_cfg = get_default_controller_config("JOINT_POSITION")
         robot_interface.reset()
+        startup_stage = "robot_state_wait"
+        logger.info("Startup stage=%s", startup_stage)
         if not wait_for_robot_state(robot_interface):
             raise RuntimeError("robot state was not received")
         # Warm the controller before an episode so its one-time dummy-message
         # handshake cannot consume the first target-time action's deadline.
+        startup_stage = "controller_warmup"
+        logger.info("Startup stage=%s", startup_stage)
         robot_interface.control(
             controller_type=args.controller_type,
             action=np.array([0.0] * 6 + [-1.0], dtype=np.float64),
@@ -1460,6 +2438,8 @@ def main():
             enforce_control_frequency=False,
         )
 
+        startup_stage = "control_loop"
+        logger.info("Startup complete; stage=%s", startup_stage)
         logger.info(
             "Keys: b=begin, e=end, s=save success, f=save failure, "
             "d=discard, r=reset joints, p=toggle part poses, q=quit"
@@ -1476,8 +2456,35 @@ def main():
         grid_start_wall_time_ns = None
         grid_index = 0
         pending_command = None
+        camera_history_cursor = None
         draw_part_poses = bool(args.draw_part_poses)
-        prompt_depth_error = None
+
+        def drain_camera_buffer():
+            nonlocal camera_history_cursor
+            if episode.state != "recording" or not episode.buffered_mode:
+                return
+            try:
+                samples, camera_history_cursor = camera.samples_since(
+                    camera_history_cursor
+                )
+                episode.add_camera_samples(samples)
+            except Exception as exc:
+                episode.mark_buffer_error(
+                    f"camera history drain failed: {type(exc).__name__}: {exc}"
+                )
+
+        def stop_buffered_episode():
+            drain_camera_buffer()
+            return episode.stop_buffered(
+                robot_interface.timestamped_robot_state_buffer(),
+                robot_interface.timestamped_gripper_state_buffer(),
+                prompt_depth_estimator=prompt_depth_estimator,
+                prompt_depth_cameras=prompt_depth_cameras,
+                camera_max_residual_ms=args.camera_match_max_residual_ms,
+                camera_pair_max_skew_ms=args.camera_pair_max_skew_ms,
+                robot_max_residual_ms=args.robot_state_max_residual_ms,
+                gripper_max_residual_ms=args.gripper_state_max_residual_ms,
+            )
 
         def cancel_pending_command(reason):
             nonlocal pending_command
@@ -1489,7 +2496,15 @@ def main():
                 drop_reason=reason,
                 dropped_wall_time_ns=time.time_ns(),
             )
-            episode.record_dropped_command(timing)
+            episode.record_dropped_command(
+                timing,
+                invalidate_continuity=reason not in {
+                    "operator_stopped_episode",
+                    "operator_discarded_episode",
+                    "operator_quit",
+                    "spacemouse_stop",
+                },
+            )
             pending_command = None
 
         def dispatch_pending_command(now_monotonic):
@@ -1563,11 +2578,8 @@ def main():
                 for channel in ("robot", "gripper")
             ):
                 pending_command["timing"]["status"] = "executed"
-                episode.append(
-                    pending_command["observation"],
-                    pending_command["saved_action"],
-                    pending_command["saved_action_original"],
-                    action_absolute=pending_command["saved_action_absolute"],
+                episode.append_buffered(
+                    pending_command["scaled_action"],
                     action_timing=pending_command["timing"],
                 )
                 pending_command = None
@@ -1575,26 +2587,12 @@ def main():
         with NonBlockingKeyReader() as key_reader:
             running = True
             while running:
+                drain_camera_buffer()
                 camera_sample = camera.latest()
                 prompt_result = None
-                observation_camera_sample = camera_sample
-                if prompt_depth_worker is not None:
-                    prompt_depth_worker.submit(camera_sample)
-                    prompt_result = prompt_depth_worker.latest()
-                    observation_camera_sample = _camera_sample_with_prompt_depth(
-                        prompt_result,
-                        prompt_depth_cameras,
-                    )
-                    if prompt_result is not None and prompt_result.get("error"):
-                        if prompt_result["error"] != prompt_depth_error:
-                            prompt_depth_error = prompt_result["error"]
-                            logger.error(
-                                "PromptDA processing failed: %s",
-                                prompt_depth_error,
-                            )
                 observation = build_observation(
                     robot_interface,
-                    observation_camera_sample,
+                    camera_sample,
                     args.eepose_frame,
                 )
                 annotation_observation = None
@@ -1602,6 +2600,7 @@ def main():
                     args.real_skill_annotation
                     and not args.no_camera_preview
                     and observation is not None
+                    and episode.state != "recording"
                 ):
                     capture_ns = observation.get("camera_capture_wall_time_ns")
                     if (
@@ -1652,7 +2651,17 @@ def main():
                             keys.append(chr(window_key))
                 for key in keys:
                     if key == "b":
-                        if episode.begin(observation):
+                        camera_history_cursor = camera.history_cursor()
+                        if episode.begin_buffered(
+                            observation,
+                            camera_start_sequence=camera_history_cursor,
+                            robot_start_index=len(
+                                robot_interface.timestamped_robot_state_buffer()
+                            ),
+                            gripper_start_index=len(
+                                robot_interface.timestamped_gripper_state_buffer()
+                            ),
+                        ):
                             if (
                                 annotation_session_factory is not None
                                 and not args.no_camera_preview
@@ -1668,7 +2677,7 @@ def main():
                             pending_command = None
                     elif key == "e":
                         cancel_pending_command("operator_stopped_episode")
-                        episode.stop(observation)
+                        stop_buffered_episode()
                     elif key == "s":
                         episode.save(success=True)
                         if (
@@ -1738,6 +2747,26 @@ def main():
                     if now < sample_time or pending_command is not None:
                         continue
                     while now >= sample_time + record_period:
+                        missed_target_wall_time_ns = monotonic_target_to_wall_time_ns(
+                            target_monotonic,
+                            monotonic_now_s=grid_start_monotonic,
+                            wall_now_ns=grid_start_wall_time_ns,
+                        )
+                        episode.record_dropped_command(
+                            {
+                                "action_target_wall_time_ns": (
+                                    missed_target_wall_time_ns
+                                ),
+                                "episode_grid_start_wall_time_ns": (
+                                    grid_start_wall_time_ns
+                                ),
+                                "grid_index": grid_index + 2,
+                                "action_period_ns": record_period_ns,
+                                "status": "missing_grid",
+                                "drop_reason": "control_loop_missed_grid",
+                                "dropped_wall_time_ns": time.time_ns(),
+                            }
+                        )
                         grid_index += 1
                         cycle_end += record_period
                         sample_time += record_period
@@ -1749,31 +2778,13 @@ def main():
                     )
                     if action is None:
                         cancel_pending_command("spacemouse_stop")
-                        episode.stop(observation)
+                        stop_buffered_episode()
                         try:
                             device.start_control(preserve_gripper=True)
                         except TypeError:
                             device.start_control()
                         continue
-                    if observation is None:
-                        grid_index += 1
-                        continue
-
                     scaled_action = scaled_deoxys_action(action, controller_cfg)
-                    saved_action = deoxys_delta_to_furniture_bench_action(
-                        scaled_action,
-                        observation["robot_state"]["wrist_pose"],
-                        args.eepose_frame,
-                    )
-                    saved_action_original = deoxys_delta_to_furniture_bench_action(
-                        scaled_action,
-                        observation["robot_state"]["wrist_pose"],
-                        "original",
-                    )
-                    saved_action_absolute = delta_action_to_absolute(
-                        saved_action,
-                        observation["robot_state"],
-                    )
                     target_wall_time_ns = monotonic_target_to_wall_time_ns(
                         target_monotonic,
                         monotonic_now_s=grid_start_monotonic,
@@ -1793,8 +2804,10 @@ def main():
                         "gripper_command_deadline_wall_time_ns": schedule.deadline_ns(
                             target_wall_time_ns, "gripper"
                         ),
-                        "observation_ready_wall_time_ns": observation.get(
-                            "observation_ready_wall_time_ns"
+                        "observation_ready_wall_time_ns": (
+                            None
+                            if observation is None
+                            else observation.get("observation_ready_wall_time_ns")
                         ),
                     }
                     if not schedule.admit(
@@ -1820,10 +2833,7 @@ def main():
                         "deoxys_action": np.asarray(
                             action, dtype=np.float64
                         ).copy(),
-                        "saved_action": saved_action,
-                        "saved_action_original": saved_action_original,
-                        "saved_action_absolute": saved_action_absolute,
-                        "observation": observation,
+                        "scaled_action": scaled_action,
                         "timing": timing,
                     }
                     grid_index += 1
@@ -1842,6 +2852,9 @@ def main():
                 )
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
+    except Exception:
+        logger.exception("Data collection failed during stage=%s", startup_stage)
+        raise
     finally:
         if episode is not None and episode.state != "idle":
             logger.warning("Unsaved in-memory episode was discarded on exit")
@@ -1863,8 +2876,6 @@ def main():
                     device.close()
                 except Exception as exc:
                     logger.warning("Failed to close SpaceMouse cleanly: %s", exc)
-            if prompt_depth_worker is not None:
-                prompt_depth_worker.stop()
             if camera is not None:
                 camera.stop()
             if not args.no_camera_preview:

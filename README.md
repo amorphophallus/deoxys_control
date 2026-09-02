@@ -415,9 +415,16 @@ python -c "from deoxys.utils.io_devices import SpaceMouse; d=SpaceMouse(vendor_i
 `rs-enumerate-devices` 枚举后，直接使用默认配置：
 
 ```shell
+source ~/.bashrc
+conda activate rr-real
+export DEOXYS_REPO=/home/hz/code/YueHu_deoxys
+cd "$DEOXYS_REPO"
+
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
-  --interface-cfg deoxys/config/charmander.yml \
+  --interface-cfg "$DEOXYS_REPO/deoxys/config/charmander.yml" \
   --controller-type OSC_POSE \
+  --annotation-source scripted \
+  --output-suffix one-leg-v6-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --draw-part-poses \
@@ -433,16 +440,40 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 `480x270@30`、数据记录 `10 Hz`。该组合已在 FrankaControl 当前接线下双相机
 并发实测通过。
 
+`--output-suffix` 是本次 campaign 的独立目录名，每次新 campaign 必须更换；文件
+写入 `.../teleop/low/<output-suffix>/{success|failure}/`，禁止与历史 pickle 混放。
+`--annotation-source scripted` 是必填且唯一允许的 policy target provenance。
+
+正式 one-leg 数采统一使用上面的 `rr-real` 环境。2026-09-01 20:32 的第一次启动
+命令在仓库根目录传入了不存在的 `config/charmander.yml`；正确文件是上面使用的绝对
+路径。脚本现在会在启动相机前验证该文件，并把启动阶段写到控制台及
+`logs/debug.log`；未捕获异常还会连同 `stage=dual_realsense_initialization`、
+`prompt_depth_initialization`、`spacemouse_initialization`、
+`franka_interface_initialization`、`robot_state_wait` 或 `controller_warmup` 写入
+`logs/error.log`，用于区分视觉、输入设备和机器人状态错误。
+
 录制期间采用 UMI 风格机器时间合同：每个 SpaceMouse 动作先分配固定 Unix wall-time
 target，再分别按 arm/gripper latency 提前发送；已经错过 target/deadline 的动作不会
-发给机器人，也不会进入训练用 `actions`，只会写入 `command_attempts` 审计记录。
-pickle schema 为 `deoxys_furniturebench_raw_v5_target_time`，其中
+发给机器人，也不会进入训练用 `actions`。该 episode 会标记为不连续，按 `e` 后拒绝
+保存，必须用 `d` 丢弃后重采；不能再用后续动作掩盖时间轴缺口。
+
+录制阶段会把 30 Hz 双相机帧、机器人状态、夹爪状态和已执行 SpaceMouse 命令分别按
+机器时间完整放入内存 buffer，不在线挑帧，也不让 PromptDA/标注耗时干扰控制循环。
+按 `e` 后才以 10 Hz action target 为主时间轴排序，并对两台相机做不复用最近邻匹配、
+对机器人 pose/joint 做平移线性插值与姿态 Slerp、对夹爪做最近邻匹配。任何缺格、重复
+时间、相机历史溢出或 residual/skew 超阈值都会 fail closed。默认阈值是相机 `45 ms`、
+双相机 skew `40 ms`、机器人 `20 ms`、夹爪 `60 ms`，分别可用
+`--camera-match-max-residual-ms`、`--camera-pair-max-skew-ms`、
+`--robot-state-max-residual-ms` 和 `--gripper-state-max-residual-ms` 调整。
+
+pickle schema 为 `deoxys_furniturebench_raw_v6_offline_buffered`，其中
 `action_target_timestamps_ns` 是唯一主时间轴，`action_timestamps_ns` 只是相同值的
 兼容别名。默认 arm/gripper action latency 和 stale guard 都是基于现有
 `command_latency=0.01s` 的 `10 ms` 初始估计，可用
 `--robot-action-latency-ms`、`--gripper-action-latency-ms` 和
-`--action-stale-guard-ms` 调整；RGB、PromptDA depth 和状态都保留各自的 source/receive
-时间，离线处理时在 action target 上重新匹配/插值。
+`--action-stale-guard-ms` 调整；相机和状态保留各自的 source/receive 时间及最终
+residual 报告。按 `e` 后处理可能需要等待，终端打印 PromptDA/标注进度；处理完成并
+显示 `materialized` 后，才使用 `s`/`f` 保存。
 
 ### Round-table 数采（默认配置，可直接复制）
 
@@ -451,7 +482,8 @@ pickle schema 为 `deoxys_furniturebench_raw_v5_target_time`，其中
 当前默认值：
 
 `real_skill_annotation_util` 目前只支持 `one_leg`，因此 round-table 命令不要添加
-`--real-skill-annotation`。
+`--real-skill-annotation`。这条命令当前只用于相机/控制诊断，不能保存为生产训练数据；
+在 scripted annotator 实现前，保存检查会 fail closed。
 
 ```shell
 source ~/.bashrc
@@ -461,6 +493,8 @@ cd /home/hz/code/YueHu_deoxys
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
+  --annotation-source scripted \
+  --output-suffix round-table-diagnostic-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --task-name round_table \
@@ -476,7 +510,7 @@ front 预览会绘制 `P0 round_table_top`、`P1 round_table_leg` 和
 `P2 round_table_base`。首次按 `b` 前应确认 `valid=111`；数据分别保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/<output-suffix>/{success|failure}/
 ```
 
 ### Lamp 数采（默认配置，可直接复制）
@@ -485,7 +519,8 @@ $DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/{success|failure}/
 profile、记录频率和 PromptDA 沿用当前默认值：
 
 `real_skill_annotation_util` 目前只支持 `one_leg`，因此 Lamp 命令不要添加
-`--real-skill-annotation`。
+`--real-skill-annotation`。这条命令当前只用于相机/控制诊断，不能保存为生产训练数据；
+在 scripted annotator 实现前，保存检查会 fail closed。
 
 ```shell
 source ~/.bashrc
@@ -495,6 +530,8 @@ cd /home/hz/code/YueHu_deoxys
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
+  --annotation-source scripted \
+  --output-suffix lamp-diagnostic-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --task-name lamp \
@@ -510,7 +547,7 @@ front 预览会绘制 `P0 lamp_base`、`P1 lamp_bulb` 和 `P2 lamp_hood`。首�
 `b` 前应确认 `valid=111`；数据分别保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/<output-suffix>/{success|failure}/
 ```
 
 ### 完整参数命令（与默认配置相同）
@@ -521,6 +558,8 @@ $DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/{success|failure}/
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
+  --annotation-source scripted \
+  --output-suffix one-leg-v6-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --front-color-width 1280 \
@@ -573,18 +612,17 @@ Rodrigues 和 `cv2.drawFrameAxes` 投影流程。绿色 `FOUND` 表示当前帧�
 采集和 `parts_poses` 计算。
 
 `one_leg` 命令中的 `--real-skill-annotation` 会调用同级仓库
-`robust-rearrangement-custom/src/eval/real_skill_annotation_util.py` 的有状态实时接口。
+`robust-rearrangement-custom/src/eval/real_skill_annotation_util.py` 的几何标注接口。
 front 预览会额外显示紫色 guidance point，以及当前 `skill/skill_state`；这些图形只画
-在预览副本上，不会污染保存的原始 RGB。脚本为屏幕预览和写入 episode 分别维护标注
-状态：pickle 中的标注只按实际保存的 `N+1` 个 observation 推进，因此可以用离线工具
-复现。该参数目前只接受 `--task-name one_leg`。
+在预览副本上，不会污染保存的原始 RGB。预览标注不进入 pickle；按 `e` 完成时间匹配
+后，脚本新建 `mode=offline` session，严格按最终 observation 顺序重算全部标注。该参数
+目前只接受 `--task-name one_leg`。
 
 启用后，每个 observation 会保存 `skill`、`skill_state`、`assembly_step`、
 `guidance_point`、`guidance_pose`、`guidance_point_2d`、`grasp_annotation_2d` 和
-`real_annotation_debug`；pickle 根目录增加 `annotation_source`，
-`metadata.real_skill_annotation.mode` 为 `online`、`complete` 为 `true`。如果在线标注
-中途异常，机械臂控制和原始数采不会被强制终止，但终端会打印错误，metadata 的
-`complete` 会变为 `false`；此时应使用 rr 的离线命令重新标注该 pickle。
+`real_annotation_debug`；pickle 根目录固定写入 `annotation_source=scripted`，并在
+metadata 记录实现为 `real_skill_annotation_util`、`mode=offline`。最终标注或几何验证
+任一帧失败都会拒绝保存，不能把预览结果或 VLM prediction 当作 ground truth。
 
 原始 episode 保存到：
 
@@ -592,7 +630,8 @@ front 预览会额外显示紫色 guidance point，以及当前 `skill/skill_sta
 $DATA_DIR_RAW/raw/osc/real/<task-name>/teleop/low/{success|failure}/
 ```
 
-每个 pickle 包含 `N+1` 个 observation、`N` 个 8 维 delta action 和 `N` 个 reward。
+新 schema 每个 pickle 包含同为 `N` 个的 target-time observation、8 维 delta action
+和 reward；旧 schema 仍可能是 `N+1` observation / `N` action。
 `color_image1`/`depth_image1` 是 wrist，`color_image2`/`depth_image2` 是 front。
 RGB 为 `240x320 uint8`，对齐到 RGB 的 depth 为正米制 `240x320 float16`。
 `parts_poses` 使用 FurnitureBench AprilTag 坐标系：`one_leg` 是 5 个零件加障碍物，
@@ -638,14 +677,16 @@ pip install huggingface-hub
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-推荐 ViT-L、`max-size 448` 和 `320x240` 保存分辨率，因为双相机实测约
-`16.79 observation/s`，能够覆盖当前 `10 Hz` 数采频率且已经确认视觉效果。
+推荐 ViT-L、`max-size 448` 和 `320x240` 保存分辨率；双相机历史实测约
+`16.79 observation/s`，但正式数采不再依赖它满足实时控制 deadline。
 
-### 方案一：在线预览并保存增强深度
+### 方案一：episode 结束后离线增强并保存
 
-SpaceMouse record 新增的 PromptDA 参数会实时显示 wrist/front 的 RGB、原始 depth
-和增强 depth，同时把增强后的 `320x240 float16` 米制 depth 保存到 pickle 的
-`depth_image1/2`；原始 RealSense depth 保存在 `depth_image1/2_realsense`。
+SpaceMouse record 的 PromptDA 参数只在按 `e`、完成 target-time 筛选重排后运行，
+不会占用录制控制循环。它会处理最终选中的每一帧，把增强后的 `320x240 float16`
+米制 depth 保存到 `depth_image1/2`；原始 RealSense depth 原样保存在
+`depth_image1/2_realsense`。RGB 始终保持相机原始像素，colored guidance point 只在
+后续 pickle-to-LMDB 转换中渲染。
 
 ```shell
 source ~/.bashrc
@@ -656,6 +697,8 @@ export HF_ENDPOINT=https://hf-mirror.com
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
   --controller-type OSC_POSE \
+  --annotation-source scripted \
+  --output-suffix one-leg-v6-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --record-image-width 320 \
@@ -685,12 +728,13 @@ python -m deoxys.examples.process_pickle_prompt_depth \
 ```
 
 输出文件名为 `示例_promptda_vitl.pkl`、`示例_promptda_vitl.metrics.json` 和
-`示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与在线方案一致。
+`示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与数采结束后离线
+增强方案一致。
 
 ## RR 四条件真机 Eval（UMI 机器时间）
 
 以下命令在 FrankaControl 图形桌面终端运行。策略以 front RealSense source time 为
-`T_obs`，action chunk 的目标时间固定为 `T_obs + k * 100 ms`；推理结束时 arm 和
+`T_obs`，action chunk 的目标时间固定为 `T_obs + k * action_period`；推理结束时 arm 和
 gripper 使用一次公共 stale-prefix 筛选，再按各自 latency 在 target 前发送。整块过期
 时清空并 hold/requery，不执行 UMI 原代码中“把最后一个 action 重排到下一格”的
 fallback。四个 checkpoint 的旧 Real40 数据属于 `legacy_v2_proxy` 近似对齐，可以
@@ -710,6 +754,34 @@ librealsense，会在退出阶段触发 glibc heap corruption；`evaluate_policy
 `--execute`。workspace 数值是当前 one-leg 配置，工作台或机器人基座位置改变后必须
 重新测量。
 
+程序完成 warmup 后停在 `IDLE`，不会自动开始：`r` 使用与正式数采相同的 joint
+reset 目标，`b` 重置在线标注状态并 begin，`e` 丢弃未执行 action、保持当前位姿、
+重置标注状态并回到 `IDLE`，`q` 退出。reset 只允许在 `IDLE` 执行。首次真机建议
+`--execution-frequency 5`，即 200 ms/action；这会整体拉伸 UMI target-time 时间轴，
+并非简单地跳过 10 Hz action。
+
+### Workspace 与末端高度安全边界（当前 one-leg）
+
+2026-09-01 现场测量确认 tabletop 必须允许比原边界低约 3 cm，因此当前 one-leg
+参数先从 `workspace z_min=0.03/min_ee_z=0.04` 调整为 `0.00/0.01`；随后根据
+2026-09-01 pick 实测中被拒绝的 `z=0.0065–0.0097 m`，将 `min_ee_z` 再向下
+放宽 0.5 cm 到 `0.005 m`。该测量只适用于当前工作台和基座位置。
+
+- `--workspace-min 0.30 -0.35 0.00`：机器人基座坐标系中的 XYZ 下界。
+
+- `--workspace-max 0.75 0.35 0.60`：机器人基座坐标系中的 XYZ 上界。
+
+- `--min-ee-z 0.005`：末端执行器 Z 的独立硬下界。
+
+- `--max-translation-step-m 0.05`：单条命令的平移硬上限。当前 5 Hz 下仍同时受
+  `--max-translation-speed-m-s 0.25` 限制，因此有效上限为 5 cm/action；切回更高
+  频率时速度限制会自动给出更小的有效单步上限。
+
+这些参数和 `--execution-frequency 5` 已同时写入程序默认值及下面的正式运行数组。
+已有终端中的旧 `RR_EVAL_ARGS` 不会因 README 更新而自动改变；每次开始一组实验都要
+重新执行完整的准备代码块。日志第一行的 `workspace_min`、`workspace_max`、`min_ee_z`
+和 `execution_frequency_hz` 是本次进程实际采用的权威值。
+
 ```shell
 source ~/.bashrc
 conda activate rr-real
@@ -718,16 +790,18 @@ export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
 export CKPT_ROOT=/home/hz/checkpoints/ppu96-real-sim-oneleg-20260828-a
 cd "$RR_ROOT"
 
+unset RR_EVAL_ARGS
 RR_EVAL_ARGS=(
   --interface-cfg "$DEOXYS_ROOT/deoxys/config/charmander.yml"
   --latency-profile "$RR_ROOT/src/real/latency_profile.estimated_10ms.json"
-  --frequency 10
-  --query-interval-steps 4
+  --execution-frequency 10
+  --query-interval-steps 3
   --max-action-lateness-ms 10
   --max-wall-time-s 180
-  --workspace-min 0.30 -0.35 0.03
+  --workspace-min 0.30 -0.35 0.00
   --workspace-max 0.75 0.35 0.60
-  --min-ee-z 0.04
+  --min-ee-z 0.005
+  --max-translation-step-m 0.05
   --prompt-depth-model vitl
   --prompt-depth-device cuda
   --execute
@@ -759,7 +833,7 @@ fc3b5cc125a4d5f5b7ea6d7c9859411d0f5296e62d9cb40e6a1cd6f4852bbb98  real40-sim400
 # sim400
 python -m src.real.evaluate_policy \
   --checkpoint "$CKPT_ROOT/sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/sim400.jsonl" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
   "${RR_EVAL_ARGS[@]}"
 ```
 
@@ -767,7 +841,7 @@ python -m src.real.evaluate_policy \
 # real10 + sim400
 python -m src.real.evaluate_policy \
   --checkpoint "$CKPT_ROOT/real10-sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real10-sim400.jsonl" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real10-sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
   "${RR_EVAL_ARGS[@]}"
 ```
 
@@ -775,7 +849,7 @@ python -m src.real.evaluate_policy \
 # real40
 python -m src.real.evaluate_policy \
   --checkpoint "$CKPT_ROOT/real40/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real40.jsonl" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real40-$(date +%Y%m%dT%H%M%S).jsonl" \
   "${RR_EVAL_ARGS[@]}"
 ```
 
@@ -783,7 +857,7 @@ python -m src.real.evaluate_policy \
 # real40 + sim400
 python -m src.real.evaluate_policy \
   --checkpoint "$CKPT_ROOT/real40-sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real40-sim400.jsonl" \
+  --log-path "$RR_ROOT/logs/real_policy_eval/real40-sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
   "${RR_EVAL_ARGS[@]}"
 ```
 

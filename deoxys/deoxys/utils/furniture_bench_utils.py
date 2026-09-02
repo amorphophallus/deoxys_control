@@ -2,6 +2,7 @@
 
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -488,6 +489,7 @@ class DualRealSenseSnapshotter:
         wrist_depth_width=None,
         wrist_depth_height=None,
         wrist_depth_fps=None,
+        history_size=256,
     ):
         if str(front_serial) == str(wrist_serial):
             raise ValueError("front and wrist camera serials must differ")
@@ -536,6 +538,8 @@ class DualRealSenseSnapshotter:
         self._thread = None
         self._thread_error = None
         self._latest = None
+        self._history = deque(maxlen=max(2, int(history_size)))
+        self._next_sequence = 0
 
     def start(self):
         devices = connected_realsense_devices()
@@ -604,6 +608,7 @@ class DualRealSenseSnapshotter:
                     "wrist_timestamp_domain": wrist["timestamp_domain"],
                     "front_frame_number": front["frame_number"],
                     "wrist_frame_number": wrist["frame_number"],
+                    "capture_sequence": self._next_sequence,
                 }
                 if self.tracker is not None:
                     sample.update(
@@ -611,6 +616,8 @@ class DualRealSenseSnapshotter:
                     )
                 with self._lock:
                     self._latest = sample
+                    self._history.append(sample)
+                    self._next_sequence += 1
         except Exception as exc:
             self._thread_error = exc
             self._stop_event.set()
@@ -625,6 +632,43 @@ class DualRealSenseSnapshotter:
                 key: value.copy() if isinstance(value, np.ndarray) else value
                 for key, value in self._latest.items()
             }
+
+    def history_cursor(self):
+        """Return the sequence number assigned to the next captured pair."""
+
+        if self._thread_error is not None:
+            raise RuntimeError("dual RealSense capture failed") from self._thread_error
+        with self._lock:
+            return int(self._next_sequence)
+
+    def samples_since(self, sequence):
+        """Return every buffered pair at or after ``sequence`` plus a new cursor.
+
+        The method fails closed if the consumer fell behind the bounded capture
+        history.  Callers can then invalidate the current episode instead of
+        silently losing camera frames.
+        """
+
+        if self._thread_error is not None:
+            raise RuntimeError("dual RealSense capture failed") from self._thread_error
+        sequence = int(sequence)
+        with self._lock:
+            if self._history:
+                oldest = int(self._history[0]["capture_sequence"])
+                if sequence < oldest:
+                    raise RuntimeError(
+                        "dual RealSense history overflow: requested sequence "
+                        f"{sequence}, oldest available is {oldest}"
+                    )
+            samples = [
+                {
+                    key: value.copy() if isinstance(value, np.ndarray) else value
+                    for key, value in sample.items()
+                }
+                for sample in self._history
+                if int(sample["capture_sequence"]) >= sequence
+            ]
+            return samples, int(self._next_sequence)
 
     def metadata(self):
         return {
