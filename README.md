@@ -782,18 +782,123 @@ reset 目标，`b` 重置在线标注状态并 begin，`e` 丢弃未执行 actio
 重新执行完整的准备代码块。日志第一行的 `workspace_min`、`workspace_max`、`min_ee_z`
 和 `execution_frequency_hz` 是本次进程实际采用的权威值。
 
+### Eval 前准备：一次标定完整 timing profile
+
+更换控制 PC、NUC、网络路径、任一 RealSense、控制器配置或 gripper 后，在启动
+eval 前重新运行同一个标定入口。默认 `--component all` 一次采集六项 latency，另存
+RealSense、robot/gripper protobuf uptime 到主机时钟的 affine mapping、offset、drift、
+residual，以及前腕相机 timestamp skew。
+
+相机项要求两台 RealSense 均成功启用 `global_time_enabled`，且 frame timestamp domain
+为 `global_time` 或 `system_time`；否则脚本 fail closed，不生成错误 profile。robot 和
+gripper protobuf 只提供设备 uptime、没有共享 epoch，因此绝对 observation latency
+采用与 UMI 相同的半 RTT 近似，uptime 拟合只用于检查 drift/jitter，不能冒充单程延迟。
+
+action 标定会让末端沿选定轴往返 10 mm，并让空夹爪开合；运行前必须清空工作区和
+夹爪，确认当前末端位于 `--workspace-min/max` 内，并准备好急停。不要在测量期间触碰
+机器人。
+
+arm 标定与已验证的 `src.real.evaluate_policy` 使用同一条发送路径：OSC_POSE absolute
+pose（`is_delta=false`）、`LINEAR_POSE`、`time_fraction=2.0`，并以 5 Hz 重发目标
+absolute pose。不要把它改回 `osc-pose-controller.yml` 原始的 delta/0.3 配置；短促 delta
+脉冲与实际 eval 的控制时序不同，也可能让 NUC 的 libfranka 控制循环异常退出。
+等待运动 onset 时也会像 policy eval 的 idle hold 一样持续重发同一个 target；stdout 会
+输出实际模块路径、resolved controller 配置、每次 target send、robot state age 和相对
+baseline 的位移。若仍失败，请保留 FrankaControl 与 NUC 两端从启动到退出的完整输出。
+gripper 的单条 ZMQ 命令可能因 NUC subscriber 的 `try_lock` 竞态被吞掉；标定默认会按
+state onset 确认并最多重发 3 次，每次尝试单独记录发送时间，不把失败等待计入 latency。
+
+```shell
+source ~/.bashrc
+conda activate rr-real
+export RR_ROOT=/home/hz/code/robust-rearrangement-custom
+export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
+CAL_TAG=$(date +%Y%m%dT%H%M%S)
+export LATENCY_PROFILE_DIR="$RR_ROOT/logs/latency"
+LATENCY_PROFILE_OUTPUT="$LATENCY_PROFILE_DIR/latency_profile-$CAL_TAG.json"
+cd "$DEOXYS_ROOT/deoxys"
+
+python -m deoxys.examples.calibrate_action_latency \
+  --interface-cfg "$DEOXYS_ROOT/deoxys/config/charmander.yml" \
+  --controller-cfg "$DEOXYS_ROOT/deoxys/config/osc-pose-controller.yml" \
+  --component all \
+  --trials 6 \
+  --arm-axis z \
+  --arm-step-m 0.010 \
+  --arm-threshold-m 0.0005 \
+  --arm-command-frequency-hz 5 \
+  --controller-time-fraction 2.0 \
+  --gripper-command-attempts 3 \
+  --workspace-min 0.30 -0.35 0.00 \
+  --workspace-max 0.75 0.35 0.60 \
+  --output "$RR_ROOT/logs/latency/full-latency-calibration-$CAL_TAG.json" \
+  --base-latency-profile "$RR_ROOT/src/real/latency_profile.estimated_10ms.json" \
+  --profile-output "$LATENCY_PROFILE_OUTPUT" \
+  --execute
+```
+
+同一个命令可连续运行多次。若目标文件已经存在，标定程序不会覆盖，而会让 full JSON
+与 profile 成对追加 `-run02`、`-run03` 等后缀；stdout 会打印每次实际写入的完整路径。
+
+2026-09-08 在 FrankaControl 上连续三次标定的结果如下。每次结果写作
+`median（p95）`，三次合并值使用全部原始 samples；单位均为 ms。
+
+| 参数与最终推荐值 | 起点事件与时间戳/时钟域 | 终点事件与时间戳/时钟域 | 实际计算 | 第 1 次 | 第 2 次 | 第 3 次 | 三次合并 median（p95） |
+|---|---|---|---|---:|---:|---:|---:|
+| `front_observation_ms` = **36.810** | 前 RealSense 彩色帧曝光；`color_frame.get_timestamp()`，由 `global_time_enabled` 映射到 FrankaControl system/global time | `read()` 完成取帧、depth-to-color alignment、depth 转换和 RGB 拷贝；FrankaControl `time.time_ns()` | `t_ready_FC - t_exposure_FC` | 37.322（44.227） | 36.339（39.654） | 39.711（43.582） | 36.810（43.623） |
+| `wrist_observation_ms` = **40.304** | 腕 RealSense 彩色帧曝光；同上，映射到 FrankaControl system/global time | 腕相机 `read()` 完成全部处理；FrankaControl `time.time_ns()` | `t_ready_FC - t_exposure_FC` | 33.148（46.263） | 41.044（74.667） | 32.988（45.760） | 40.304（74.490） |
+| `robot_observation_ms` = **0.067** | 概念起点是 NUC 发出 robot-state ZMQ；protobuf 只有 NUC/机器人 device uptime，没有与 FrankaControl 对齐的 wall time | FrankaControl 收到并解析 robot state 后的 `time.time_ns()` | 不跨主机直接相减；用 FrankaControl 发起的 ICMP RTT / 2 近似 | 0.067（0.089） | 0.059（0.075） | 0.068（0.090） | 0.0665（0.089） |
+| `gripper_observation_ms` = **0.067** | 概念起点是 NUC 发出 gripper-state ZMQ；同样没有共享 wall time | FrankaControl 收到并解析 gripper state 后的 `time.time_ns()` | 同样使用 NUC ICMP RTT / 2 近似 | 0.067（0.089） | 0.059（0.075） | 0.068（0.090） | 0.0665（0.089） |
+| `robot_action_ms` = **120.000** | arm ZMQ publish 返回后；FrankaControl `time.time_ns()` | FrankaControl 收到的 robot state 中首次连续两帧 EE 位移 ≥0.5 mm，取第一帧的本机 receive `time.time_ns()` | `(t_onset_receive_FC - t_publish_FC) - robot_observation_ms` | 122.656（144.627） | 117.415（127.299） | 119.784（142.916） | 119.047（148.154） |
+| `gripper_action_ms` = **642.000** | gripper ZMQ publish 返回后；FrankaControl `time.time_ns()` | FrankaControl 收到的 gripper state 中首次连续两帧 width 变化 ≥2 mm，取第一帧的本机 receive `time.time_ns()` | `(t_onset_receive_FC - t_publish_FC) - gripper_observation_ms` | 668.781（1244.734） | 621.534（982.369） | 720.153（1109.517） | 641.725（1237.695） |
+| `action_stale_guard_ms` = **10.000** | 非物理 latency，无跨时钟端点 | stale-prefix admission 的额外调度余量 | 从 base profile 继承，本次不标定 | 10 | 10 | 10 | 10 |
+
+NUC 与 FrankaControl 的 wall clock 不保证对齐，代码也不使用二者的 wall-time 差值。
+robot/gripper observation 的 RTT/2 不要求时钟同步，但只是网络单程延迟近似，不能单独
+识别 NUC publisher 的排队、序列化和线程调度时间。action latency 的发送和接收端点都由
+FrankaControl 打时间戳，因此不受两台主机 clock offset 影响。完整 JSON
+保留原始样本、median、p95、clock fit 和方法限制；eval profile 写入六项推荐 latency，
+只从 base profile 继承 `action_stale_guard_ms` 等非物理延迟配置，并在
+`calibrated_fields` / `inherited_fields` 中明确记录。默认用 median 做时间对齐，p95 用于
+判断抖动和设置 guard；若 p95 与 median 相差很大，应先排查 USB、网络和状态 publisher。
+
+当前 RR evaluator 直接以共享时钟上的相机曝光 timestamp 为 `t_obs`，因此不会再从
+`t_obs` 减去 `front/wrist_observation_ms`；这两个字段记录 camera pipeline 的可用性延迟，
+用于审计 observation age、action horizon 和 drop 数量。robot/gripper state 没有共享
+epoch，`robot/gripper_observation_ms` 才会作为 receive-time correction 实际参与插值。
+
+arm/gripper 的 open/close、正/反方向原始 trial 均保留。夹爪还会单独输出 open/close
+统计；若两者相差超过一个控制周期，当前单一 `gripper_action_ms` 只是折中值，应先扩展
+runtime schema 后再按方向调度。新标定完成后可用目录模式检查当天最新的 profile；
+目录模式会解析 `measured_at`，仅在本地当天的文件中选择时间最新者，若当天没有有效
+profile 则直接报错，不会退回昨天的参数：
+
+```shell
+cd "$RR_ROOT"
+python - <<'PY'
+from pathlib import Path
+from src.real.time_alignment import LatencyProfile
+
+profile = LatencyProfile.resolve_path(Path("logs/latency"))
+print(profile)
+print(LatencyProfile.load(profile))
+PY
+```
+
 ```shell
 source ~/.bashrc
 conda activate rr-real
 export RR_ROOT=/home/hz/code/robust-rearrangement-custom
 export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
 export CKPT_ROOT=/home/hz/checkpoints/ppu96-real-sim-oneleg-20260828-a
+export LATENCY_PROFILE="$RR_ROOT/src/real/latency_profile.measured_20260908.json"
 cd "$RR_ROOT"
+test -f "$LATENCY_PROFILE"
 
 unset RR_EVAL_ARGS
 RR_EVAL_ARGS=(
   --interface-cfg "$DEOXYS_ROOT/deoxys/config/charmander.yml"
-  --latency-profile "$RR_ROOT/src/real/latency_profile.estimated_10ms.json"
+  --latency-profile "$LATENCY_PROFILE"
   --execution-frequency 10
   --query-interval-steps 3
   --max-action-lateness-ms 10
