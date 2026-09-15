@@ -73,7 +73,18 @@ RECORD_INTRINSICS = {
 class SpaceMouseConnectionTest(unittest.TestCase):
     def parse(self, *arguments):
         with patch.dict(os.environ, {"DATA_DIR_RAW": "/tmp"}):
-            with patch.object(sys, "argv", ["record", *arguments]):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "record",
+                    "--annotation-source",
+                    "scripted",
+                    "--output-suffix",
+                    "test",
+                    *arguments,
+                ],
+            ):
                 return parse_args()
 
     def test_wired_is_the_default(self):
@@ -227,6 +238,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/real-annotation-test",
             task_name="one_leg",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=writer,
             annotation_session_factory=session_factory,
@@ -277,6 +289,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/real-annotation-failure-test",
             task_name="one_leg",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=writer,
             annotation_session_factory=lambda task_name, camera_info: (
@@ -296,7 +309,7 @@ class PartPosePreviewTest(unittest.TestCase):
         metadata = writer.payload["metadata"]["real_skill_annotation"]
         self.assertFalse(metadata["complete"])
         self.assertIn("test failure", metadata["error"])
-        self.assertNotIn("annotation_source", writer.payload)
+        self.assertEqual(writer.payload["annotation_source"], "scripted")
         for observation in writer.payload["observations"]:
             self.assertIsNone(observation["skill"])
             self.assertIsNone(observation["guidance"])
@@ -307,6 +320,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/round-table-test",
             task_name="round_table",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=MagicMock(),
         )
@@ -339,6 +353,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/lamp-test",
             task_name="lamp",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=MagicMock(),
         )
@@ -432,6 +447,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/promptda-test",
             task_name="one_leg",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=writer,
             prompt_depth_config=prompt_config,
@@ -463,6 +479,7 @@ class PartPosePreviewTest(unittest.TestCase):
             data_root="/tmp/target-time-test",
             task_name="one_leg",
             randomness="low",
+            output_suffix="test",
             camera_info={},
             writer=writer,
         )

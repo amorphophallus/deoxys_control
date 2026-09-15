@@ -2600,8 +2600,11 @@ def main():
                     args.real_skill_annotation
                     and not args.no_camera_preview
                     and observation is not None
-                    and episode.state != "recording"
                 ):
+                    # This session is preview-only, including while recording.
+                    # The payload is still reconstructed and annotated from the
+                    # timestamp-aligned buffers after ``e``; never let this
+                    # online FSM mutate or stand in for saved annotations.
                     capture_ns = observation.get("camera_capture_wall_time_ns")
                     if (
                         capture_ns is None

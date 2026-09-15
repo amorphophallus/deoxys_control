@@ -154,10 +154,18 @@ export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys/deoxys
 export ROBUST_REARRANGEMENT_ROOT=/home/hz/code/robust-rearrangement-custom
 export FURNITURE_BENCH="$ROBUST_REARRANGEMENT_ROOT/furniture-bench"
 export RARL_SOURCE_DIR="$ROBUST_REARRANGEMENT_ROOT"
-export DATA_DIR_RAW=/media/hz/e23044d0-8588-4f1e-b760-0912d3b4655d/robust-rearrangement-data
-export DATA_DIR_PROCESSED="$DATA_DIR_RAW"
+export RR_STORAGE_ROOT=/media/hz/e23044d0-8588-4f1e-b760-0912d3b4655d/robust-rearrangement-data
+export DATA_DIR_RAW="$RR_STORAGE_ROOT"
+export DATA_DIR_PROCESSED="$RR_STORAGE_ROOT"
+export RR_CHECKPOINT_ROOT="$RR_STORAGE_ROOT/checkpoints"
 export PYTHONPATH="$DEOXYS_ROOT:$ROBUST_REARRANGEMENT_ROOT:$FURNITURE_BENCH${PYTHONPATH:+:$PYTHONPATH}"
 ```
+
+FrankaControl 的大体积数据和 checkpoint 优先放在 `RR_STORAGE_ROOT` 所在的 15 TB
+本地盘；`/home/hz` 只保留代码、环境和小型日志。当前目录约定为：原始数据放在
+`$DATA_DIR_RAW/raw/`，处理后数据放在 `$DATA_DIR_PROCESSED/processed/`，checkpoint
+放在 `$RR_CHECKPOINT_ROOT/<campaign>/`。开始任务前用 `df -h "$RR_STORAGE_ROOT"`
+确认该盘已挂载；如果命令显示根分区 `/dev/nvme1n1p2`，不要继续写入大文件。
 
 首次安装 adapter 依赖：
 
@@ -618,6 +626,11 @@ front 预览会额外显示紫色 guidance point，以及当前 `skill/skill_sta
 后，脚本新建 `mode=offline` session，严格按最终 observation 顺序重算全部标注。该参数
 目前只接受 `--task-name one_leg`。
 
+按 `b` 开始后，dashboard 会继续运行一套独立的实时 FSM，持续显示当前
+`skill/skill_state` 和 guidance point，方便确认遥操作阶段。它只消费当前预览帧，既不
+写入 raw buffer，也不参与保存；按 `e` 后仍以对齐到 action 时间线的观测重新执行离线
+标注，离线结果是 pickle 中唯一的 ground truth。
+
 启用后，每个 observation 会保存 `skill`、`skill_state`、`assembly_step`、
 `guidance_point`、`guidance_pose`、`guidance_point_2d`、`grasp_annotation_2d` 和
 `real_annotation_debug`；pickle 根目录固定写入 `annotation_source=scripted`，并在
@@ -731,14 +744,32 @@ python -m deoxys.examples.process_pickle_prompt_depth \
 `示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与数采结束后离线
 增强方案一致。
 
-## RR 四条件真机 Eval（UMI 机器时间）
+## RR 240×320 full-frame 真机 Eval（3000 / 5000 epoch）
 
 以下命令在 FrankaControl 图形桌面终端运行。策略以 front RealSense source time 为
-`T_obs`，action chunk 的目标时间固定为 `T_obs + k * action_period`；推理结束时 arm 和
-gripper 使用一次公共 stale-prefix 筛选，再按各自 latency 在 target 前发送。整块过期
-时清空并 hold/requery，不执行 UMI 原代码中“把最后一个 action 重排到下一格”的
-fallback。四个 checkpoint 的旧 Real40 数据属于 `legacy_v2_proxy` 近似对齐，可以
-正常 eval；该 provenance 不会切换或放宽真机 stale-action 规则。
+`T_obs`，action chunk 的目标时间固定为 `T_obs + k * action_period`。推理在后台 worker
+运行，主线程独占 `FrankaInterface`，并按各自 deadline 独立调度 arm queue 和 gripper
+queue。通过公共 admission cutoff 且安全检查通过的 action 会原子地进入两条 queue；
+单个通道事件过期只丢弃该事件，不再清空其后的 action。已进入 immutable timeline 的
+timestep 不允许被后续 query 覆盖，后续 query 只能向 timeline 尾部追加。本轮使用
+campaign `rr_real_sim_fullframe_cotrain_0907`：包含 `real40`、
+`real40_sim400` 和 `real10_sim400` 三组，每组各有 3000、5000 epoch，共 6 个固定
+checkpoint。NAS 上没有同批次 `sim400` 的 3000/5000 checkpoint，因此本轮不运行
+`sim400`。所有 checkpoint 都是 240×320 full-frame RGB-D，配置中的
+`data.image_spatial_transform=none`；eval 不再 crop 或 resize。
+
+`evaluate_policy` 会直接读取 checkpoint 配置决定标注方式。本轮 checkpoint 的
+`annotate_guidance_point_colored=true`，因此每次 query 都会先实时运行 real annotation
+util，再把 colored guidance point 画入 front RGB 后送给策略；wrist RGB 按训练契约保持
+不画点。`--show-input-dashboard` 会在按 `b` 后第一次成功 query 时打开一个 OpenCV 页面，
+随后逐 query 更新。页面同时显示经过 checkpoint 图像变换后、实际送入策略的 240×320
+front/wrist RGB、两路 PromptDA 深度、本体状态、skill/skill_state、guidance point 及两相机投影、零件检测有效性、延迟，
+以及预测 action chunk 中张开/闭合夹爪的数量。wrist 的 guidance UV 只作为诊断文字显示，
+不会改变 wrist 策略输入。操作 `r/b/e/q` 时仍需让终端获得键盘焦点。
+页面和终端会分别报告整段 chunk 的闭合预测数、下一次 query 前近期执行窗口中的闭合
+预测数、两条 queue 的长度、immutable coverage、保留的 occupied timestep 和
+warm-start 映射数。已经进入 timeline 的动作不会被下一段 receding-horizon query
+覆盖；gripper 每个 timestep 都会消费，但只有 sign 改变时才发送物理命令。
 
 在 FrankaControl 上必须保持启动顺序为“两路 RealSense 管线 → CUDA policy →
 PromptDA/Deoxys”。这不是性能优化：该机器上如果先初始化 CUDA 再启动
@@ -749,9 +780,9 @@ librealsense，会在退出阶段触发 glibc heap corruption；`evaluate_policy
 `/home/mingyu/code/deoxys_control/deoxys/run2.sh` 和 `run3.sh`；不要用放宽超时或直接
 加 `--execute` 绕过检查。
 
-先准备环境变量和公共安全参数。第一次运行应暂时从 `RR_EVAL_ARGS` 删除 `--execute`
-完成 dry-run；确认相机时间域、PromptDA、checkpoint 和状态插值正常后，再恢复
-`--execute`。workspace 数值是当前 one-leg 配置，工作台或机器人基座位置改变后必须
+先准备环境变量和公共安全参数。下面的公共参数默认不含 `--execute`，先完成 dry-run；
+确认相机时间域、PromptDA、checkpoint、240×320 输入和状态插值正常后，再运行单独列出的
+真机执行命令。workspace 数值是当前 one-leg 配置，工作台或机器人基座位置改变后必须
 重新测量。
 
 程序完成 warmup 后停在 `IDLE`，不会自动开始：`r` 使用与正式数采相同的 joint
@@ -773,14 +804,32 @@ reset 目标，`b` 重置在线标注状态并 begin，`e` 丢弃未执行 actio
 
 - `--min-ee-z 0.005`：末端执行器 Z 的独立硬下界。
 
-- `--max-translation-step-m 0.05`：单条命令的平移硬上限。当前 5 Hz 下仍同时受
-  `--max-translation-speed-m-s 0.25` 限制，因此有效上限为 5 cm/action；切回更高
-  频率时速度限制会自动给出更小的有效单步上限。
+- `--max-translation-step-m 0.085`：单条命令的平移硬上限，即 8.5 cm。2026-09-09
+  最新 `real40_sim400-5000` run 在成功执行 127 步后，于 `place/leg-top-place` 出现
+  19 个 translation reject，范围为 `0.0567–0.0807 m`、中位数为 `0.0792 m`；目标主要
+  沿 `+x≈5.0 cm`、`+z≈6.3 cm` 移动，仍在 workspace 内。本值比实测最大值保留约 5%
+  余量。
 
-这些参数和 `--execution-frequency 5` 已同时写入程序默认值及下面的正式运行数组。
+- `--max-translation-speed-m-s 0.425`：平移速度硬上限。当前 5 Hz 下对应
+  `0.425 m/s × 0.2 s = 0.085 m/action`，与 translation step 上限一致。不能只提高
+  translation step 而保留旧的 `0.25 m/s`，否则有效上限仍是 `0.05 m/action`。
+
+- `--max-rotation-step-rad 0.40`：单条命令的旋转硬上限，约 22.9°。2026-09-09 的
+  `real40_sim400-5000` run 中 19 个 rotation reject 位于 `0.3390–0.3791 rad`，本值比
+  实测最大值保留约 5% 余量。
+
+- `--max-rotation-speed-rad-s 2.0`：旋转速度硬上限。当前 5 Hz 下对应
+  `2.0 rad/s × 0.2 s = 0.40 rad/action`，与 rotation step 上限一致。不能只提高
+  rotation step 而保留旧的 `1.5 rad/s`，否则有效上限仍是 `0.30 rad/action`。
+
+workspace 参数和 `--execution-frequency 5` 已同时写入程序默认值及下面的正式运行数组。
+上述 translation/rotation 值是本轮 one-leg 5 Hz eval 的显式覆盖值，没有修改程序全局
+默认值；更换任务或控制频率后必须重新检查动作分布。
 已有终端中的旧 `RR_EVAL_ARGS` 不会因 README 更新而自动改变；每次开始一组实验都要
-重新执行完整的准备代码块。日志第一行的 `workspace_min`、`workspace_max`、`min_ee_z`
-和 `execution_frequency_hz` 是本次进程实际采用的权威值。
+重新执行完整的准备代码块。日志第一行中的 `workspace_min`、`workspace_max`、
+`min_ee_z`、`max_translation_step_m`、`max_translation_speed_m_s`、
+`max_rotation_step_rad`、`max_rotation_speed_rad_s` 和 `execution_frequency_hz` 是本次
+进程实际采用的权威值。
 
 ### Eval 前准备：一次标定完整 timing profile
 
@@ -885,85 +934,158 @@ print(LatencyProfile.load(profile))
 PY
 ```
 
+### 固定 checkpoint 位置
+
+6 个 checkpoint 都在 RR 仓库下，不在 15 TB 盘的旧 campaign 目录：
+
+```text
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_5000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_5000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_5000.pt
+```
+
+### 选择条件和 epoch
+
+每次新开终端都复制下面整个代码块。只需要修改开头的 `RR_RUN` 和 `RR_EPOCH`：
+`RR_RUN` 可取 `real40`、`real40_sim400`、`real10_sim400`，`RR_EPOCH` 可取
+`3000` 或 `5000`。例如 `RR_RUN=real40_sim400`、`RR_EPOCH=5000` 就会选中
+real40+sim400 的 5000 epoch checkpoint。
+
 ```shell
 source ~/.bashrc
 conda activate rr-real
+
 export RR_ROOT=/home/hz/code/robust-rearrangement-custom
 export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
-export CKPT_ROOT=/home/hz/checkpoints/ppu96-real-sim-oneleg-20260828-a
+export RR_PYTHON=/home/hz/miniconda3/envs/rr-real/bin/python
+export CKPT_ROOT="$RR_ROOT/checkpoints/rr_real_sim_fullframe_cotrain_0907"
 export LATENCY_PROFILE="$RR_ROOT/src/real/latency_profile.measured_20260908.json"
+
+# 只修改这两个变量。
+RR_RUN=real40
+RR_EPOCH=5000
+
+case "$RR_RUN" in
+  real40)
+    RR_RUN_DIR=rr_fullframe0907_real40_b256_seed2026090712
+    ;;
+  real40_sim400)
+    RR_RUN_DIR=rr_fullframe0907_real40_sim400_b256_seed2026090711
+    ;;
+  real10_sim400)
+    RR_RUN_DIR=rr_fullframe0907_real10_sim400_b256_seed2026090713
+    ;;
+  *)
+    printf '错误：RR_RUN 必须是 real40、real40_sim400 或 real10_sim400，当前为 %s\n' "$RR_RUN" >&2
+    return 1 2>/dev/null || exit 1
+    ;;
+esac
+
+case "$RR_EPOCH" in
+  3000|5000) ;;
+  *)
+    printf '错误：RR_EPOCH 必须是 3000 或 5000，当前为 %s\n' "$RR_EPOCH" >&2
+    return 1 2>/dev/null || exit 1
+    ;;
+esac
+
+export RR_CHECKPOINT="$CKPT_ROOT/$RR_RUN/$RR_RUN_DIR/$RR_RUN_DIR/actor_chkpt_latest_${RR_EPOCH}.pt"
+export RR_LOG_DIR="$RR_ROOT/logs/real_policy_eval"
+
 cd "$RR_ROOT"
+test -x "$RR_PYTHON"
+test -f "$DEOXYS_ROOT/deoxys/config/charmander.yml"
 test -f "$LATENCY_PROFILE"
+test -f "$RR_CHECKPOINT"
+mkdir -p "$RR_LOG_DIR"
+printf '条件：%s\nepoch：%s\ncheckpoint：%s\n' "$RR_RUN" "$RR_EPOCH" "$RR_CHECKPOINT"
 
 unset RR_EVAL_ARGS
 RR_EVAL_ARGS=(
   --interface-cfg "$DEOXYS_ROOT/deoxys/config/charmander.yml"
   --latency-profile "$LATENCY_PROFILE"
-  --execution-frequency 10
-  --query-interval-steps 3
+  --execution-frequency 5
+  --query-interval-steps 2
   --max-action-lateness-ms 10
-  --max-wall-time-s 180
+  --max-wall-time-s 270
   --workspace-min 0.30 -0.35 0.00
   --workspace-max 0.75 0.35 0.60
   --min-ee-z 0.005
-  --max-translation-step-m 0.05
+  --max-translation-step-m 0.085
+  --max-translation-speed-m-s 0.425
+  --max-rotation-step-rad 0.40
+  --max-rotation-speed-rad-s 2.0
   --prompt-depth-model vitl
   --prompt-depth-device cuda
-  --execute
+  --show-input-dashboard
+  --save-input-video
 )
 ```
 
-下载或复制 checkpoint 后先核对完整 SHA-256：
+`--query-interval-steps` 完全由 CLI 控制，程序默认值没有硬编码为 `2`。本轮 5 Hz
+真机命令推荐使用 `2`；需要做调度对比时，可以在重新创建 `RR_EVAL_ARGS` 时改成其他
+正整数。
+
+`--show-input-dashboard` 继续逐 query 显示 RGB-D、标注、本体状态和 action 页面。
+`--save-input-video` 从按下 `b` 后的第一条成功 query 开始记录，到 `e` 为止；每帧是
+front RGB、wrist RGB、front PromptDA depth、wrist PromptDA depth 四宫格。MP4 保存在
+对应 JSONL 旁边，文件名后缀为 `-rollout-XXX-rgbd-grid.mp4`。
+每条成功 query 的 JSONL 记录也会保存完整 `parts_poses`、检测/valid 状态和 annotation
+debug，便于在后续 run 中直接恢复 pick 时的 EE-to-leg 夹持位姿并检查手动物体移动。
+
+若任一 `test` 报错，不要开始真机执行。程序启动后还要检查打印的 checkpoint 路径包含
+`rr_real_sim_fullframe_cotrain_0907`，并确认 checkpoint 配置显示
+`observation_type=rgbd`、`image_spatial_transform=none`。不要沿用旧终端里的
+`CKPT_ROOT`、`RR_CHECKPOINT` 或 `RR_EVAL_ARGS`。
+
+下载或复制 checkpoint 后可一次核对全部 6 个 SHA-256：
 
 ```shell
 sha256sum \
-  "$CKPT_ROOT/sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  "$CKPT_ROOT/real10-sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  "$CKPT_ROOT/real40/actor_chkpt_best_val_action_mse_error.pt" \
-  "$CKPT_ROOT/real40-sim400/actor_chkpt_best_val_action_mse_error.pt"
+  "$CKPT_ROOT/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_5000.pt" \
+  "$CKPT_ROOT/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_5000.pt" \
+  "$CKPT_ROOT/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_5000.pt"
 ```
 
 期望依次为：
 
 ```text
-93a1eb76092ebcde611f8a2a210a7381be5f23efa23c4cb41f4fae49aa342890  sim400
-2d143f0d83c470692ec1f42da149f249334bf6f29ee7e00bd79d36144e59bcaf  real10-sim400
-bdac2baa6ded18714402e7bcf06edcc4d594d8309959ae1273621f48cca6e85e  real40
-fc3b5cc125a4d5f5b7ea6d7c9859411d0f5296e62d9cb40e6a1cd6f4852bbb98  real40-sim400
+c663f2c16a0ae6263620195b55a9b7a6f6ce34147ef8424a62b926c65994b914  real40/3000
+157505aaaa6309ab84dd5413cf8142fc4f25929199babdfe861307382a1a9ef3  real40/5000
+fcb0d6f46cd75550bfebf16a0f441570737211593e1bb3c276da9a8740bee346  real40_sim400/3000
+bf3d45de38cc702c57116c621b9c30e29afa17b47e4d2f2b5d6549202202210d  real40_sim400/5000
+bd900d7ffa240e89f4a1ea44c9953a9fcbcff39768ceeecd1d797bd07b5e046d  real10_sim400/3000
+2d613b8b08f723401ee2ed8f6ec2a4b54de6e00ce72b22f84fba721f2d27dd7d  real10_sim400/5000
 ```
 
-四个条件分别运行：
+### 先 dry-run
+
+准备代码块默认没有 `--execute`，复制运行以下命令不会向机器人发送策略动作：
 
 ```shell
-# sim400
-python -m src.real.evaluate_policy \
-  --checkpoint "$CKPT_ROOT/sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
+"$RR_PYTHON" -m src.real.evaluate_policy \
+  --checkpoint "$RR_CHECKPOINT" \
+  --log-path "$RR_LOG_DIR/${RR_RUN}-${RR_EPOCH}-dryrun-$(date +%Y%m%dT%H%M%S).jsonl" \
   "${RR_EVAL_ARGS[@]}"
 ```
 
-```shell
-# real10 + sim400
-python -m src.real.evaluate_policy \
-  --checkpoint "$CKPT_ROOT/real10-sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real10-sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
-  "${RR_EVAL_ARGS[@]}"
-```
+### 确认后执行真机 eval
+
+确认现场安全、FCI、NUC 状态发布器、相机、PromptDA、240×320 dashboard 和状态插值均正常后，
+再复制下面的命令。只有这里显式添加 `--execute`：
 
 ```shell
-# real40
-python -m src.real.evaluate_policy \
-  --checkpoint "$CKPT_ROOT/real40/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real40-$(date +%Y%m%dT%H%M%S).jsonl" \
-  "${RR_EVAL_ARGS[@]}"
-```
-
-```shell
-# real40 + sim400
-python -m src.real.evaluate_policy \
-  --checkpoint "$CKPT_ROOT/real40-sim400/actor_chkpt_best_val_action_mse_error.pt" \
-  --log-path "$RR_ROOT/logs/real_policy_eval/real40-sim400-$(date +%Y%m%dT%H%M%S).jsonl" \
-  "${RR_EVAL_ARGS[@]}"
+"$RR_PYTHON" -m src.real.evaluate_policy \
+  --checkpoint "$RR_CHECKPOINT" \
+  --log-path "$RR_LOG_DIR/${RR_RUN}-${RR_EPOCH}-execute-$(date +%Y%m%dT%H%M%S).jsonl" \
+  "${RR_EVAL_ARGS[@]}" \
+  --execute
 ```
 
 `latency_profile.estimated_10ms.json` 明确标记为 estimated。日志中的
