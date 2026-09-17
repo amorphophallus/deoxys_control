@@ -20,6 +20,7 @@ data_collection_example
 
 # Local editor and generated runtime files
 .vscode/
+/logs/
 *.log
 *.bag
 *.mp4

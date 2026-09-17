@@ -430,9 +430,10 @@ cd "$DEOXYS_REPO"
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg "$DEOXYS_REPO/deoxys/config/charmander.yml" \
+  --latency-profile /home/hz/code/robust-rearrangement-custom/src/real/latency_profile.measured_20260908.json \
   --controller-type OSC_POSE \
   --annotation-source scripted \
-  --output-suffix one-leg-v6-scripted-rgbd-202609 \
+  --output-suffix one-leg-umi-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --draw-part-poses \
@@ -451,6 +452,10 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 `--output-suffix` 是本次 campaign 的独立目录名，每次新 campaign 必须更换；文件
 写入 `.../teleop/low/<output-suffix>/{success|failure}/`，禁止与历史 pickle 混放。
 `--annotation-source scripted` 是必填且唯一允许的 policy target provenance。
+要得到完整训练标注，还需要 `--real-skill-annotation` 和两台相机的离线 PromptDA；
+少了任一项，脚本会在启动时警告。现在仍允许保存 pickle，但会标成 `incomplete`，
+并在同名 `.txt` 记录原因。实时 dashboard 显示与最终 pickle 标注是两套独立计算，
+不能用屏幕上的标注代替离线标注。
 
 正式 one-leg 数采统一使用上面的 `rr-real` 环境。2026-09-01 20:32 的第一次启动
 命令在仓库根目录传入了不存在的 `config/charmander.yml`；正确文件是上面使用的绝对
@@ -460,28 +465,46 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 `franka_interface_initialization`、`robot_state_wait` 或 `controller_warmup` 写入
 `logs/error.log`，用于区分视觉、输入设备和机器人状态错误。
 
-录制期间采用 UMI 风格机器时间合同：每个 SpaceMouse 动作先分配固定 Unix wall-time
-target，再分别按 arm/gripper latency 提前发送；已经错过 target/deadline 的动作不会
-发给机器人，也不会进入训练用 `actions`。该 episode 会标记为不连续，按 `e` 后拒绝
-保存，必须用 `d` 丢弃后重采；不能再用后续动作掩盖时间轴缺口。
+当前录制控制已恢复为原来的 SpaceMouse 直接控制：每次循环读取**当前**摇杆状态，
+生成 `OSC_POSE` 的 delta action，调用一次同步的 `robot_interface.control()`；
+`FrankaInterface` 使用默认 `20 Hz` 控制周期，沿用原有平移/旋转缩放及限速设置。
+不积分成绝对 pose、不排队等待发送旧动作，也不使用 `--teleop-fps` 改变控制频率。
+`control()` 阻塞时本轮会等待，下轮重新读取当前摇杆输入；不会把卡顿期间的历史
+摇杆动作依次补发。
 
-录制阶段会把 30 Hz 双相机帧、机器人状态、夹爪状态和已执行 SpaceMouse 命令分别按
-机器时间完整放入内存 buffer，不在线挑帧，也不让 PromptDA/标注耗时干扰控制循环。
-按 `e` 后才以 10 Hz action target 为主时间轴排序，并对两台相机做不复用最近邻匹配、
-对机器人 pose/joint 做平移线性插值与姿态 Slerp、对夹爪做最近邻匹配。任何缺格、重复
-时间、相机历史溢出或 residual/skew 超阈值都会 fail closed。默认阈值是相机 `45 ms`、
-双相机 skew `40 ms`、机器人 `20 ms`、夹爪 `60 ms`，分别可用
-`--camera-match-max-residual-ms`、`--camera-pair-max-skew-ms`、
-`--robot-state-max-residual-ms` 和 `--gripper-state-max-residual-ms` 调整。
+相机抓帧和 episode 原始帧缓存分别在后台运行，观测拼装、实时 FSM 与 dashboard
+预览在独立的异步 worker 中运行，不进入上述控制调用。按 `b` 后先预热相机 3 秒，
+这期间不采样或发送 SpaceMouse 动作；按 `e` 后再留 1 秒相机/状态 post-roll。
+实时 FSM 在 `one_leg`、`round_table`、`lamp` 加 `--real-skill-annotation` 且打开预览时启用；dashboard
+会显示 `SKILL / skill_state` 和 front/wrist 可见的二维目标点。`FSM: OFF`、
+`WAITING FOR POSES` 或 `ERROR` 表示当前没有可用实时标注，不能误认作无目标点。
 
-pickle schema 为 `deoxys_furniturebench_raw_v6_offline_buffered`，其中
+每次成功发送都保存当轮原始 delta、审计用的绝对 wrist target 和真实 command
+timestamp，并用 `command timestamp + calibrated latency` 估算设备生效时间。
+按 `e` 后才建立固定 10 Hz 的 `t_k`：arm 和 gripper action 分别选择
+`effect_time <= t_k` 的最新已发送命令，不会使用未来 action。两台相机按曝光时间选
+最近帧，掉帧时允许复用上一帧；robot pose/joint 按修正后的状态时间插值，gripper width
+线性插值。相机 residual 超过 `50 ms` 或双相机 skew 超过 `40 ms` 只写 warning 和质量
+报告；单台相机在目标附近 `200 ms` 内完全没有帧才判定为真实 coverage gap。对应参数是
+`--camera-match-max-residual-ms`、`--camera-pair-max-skew-ms` 和
+`--camera-hard-gap-ms`。相机硬缺帧、robot state 超过 `20 ms` 或 gripper state 超过
+`60 ms` 时，对齐继续使用最近可用相机帧或插值后的本体状态，记录超阈值的 timestep 和最大残差；
+PromptDA 与离线标注仍继续运行。保存时该条进入 `incomplete/{success|failure}/`，
+并在同名 `.txt` 和 pickle 的 `alignment_report`/`save_quality` 中留下质量记录，
+不会把时间质量不足的数据默认为可直接训练的完整样本。若原始流为空等导致无法构造
+observation，仍保存原始流供之后恢复，但不能凭空生成增强深度。
+
+pickle 继续使用训练 pipeline 已识别的
+`deoxys_furniturebench_raw_v6_offline_buffered` schema，其中
 `action_target_timestamps_ns` 是唯一主时间轴，`action_timestamps_ns` 只是相同值的
-兼容别名。默认 arm/gripper action latency 和 stale guard 都是基于现有
-`command_latency=0.01s` 的 `10 ms` 初始估计，可用
-`--robot-action-latency-ms`、`--gripper-action-latency-ms` 和
-`--action-stale-guard-ms` 调整；相机和状态保留各自的 source/receive 时间及最终
-residual 报告。按 `e` 后处理可能需要等待，终端打印 PromptDA/标注进度；处理完成并
-显示 `materialized` 后，才使用 `s`/`f` 保存。
+兼容别名。训练兼容字段 `actions` 仍是 8 维 delta；`actions_absolute`、
+`raw_arm_commands_absolute`、`raw_gripper_commands` 和 `raw_spacemouse_samples` 保留
+原始 delta、由当时 EE pose 推算的绝对目标及发送审计信息；绝对目标不是在线控制输入。
+默认读取上面显式指定的实测 profile：arm action `120 ms`、gripper action
+`642 ms`、robot/gripper observation 各 `0.067 ms`；命令行中
+`--latency-profile` 会覆盖单独的 latency 参数。相机和状态保留各自的 source/receive
+时间、两个 action 通道的采样/发送时间及最终 residual 报告。按 `e` 后处理可能需要等待，
+终端打印 PromptDA/标注进度；显示 `materialized` 后才使用 `s`/`f` 保存。
 
 ### Round-table 数采（默认配置，可直接复制）
 
@@ -489,9 +512,8 @@ residual 报告。按 `e` 后处理可能需要等待，终端打印 PromptDA/�
 这里只增加 `--task-name round_table`，相机 profile、记录频率和 PromptDA 都沿用
 当前默认值：
 
-`real_skill_annotation_util` 目前只支持 `one_leg`，因此 round-table 命令不要添加
-`--real-skill-annotation`。这条命令当前只用于相机/控制诊断，不能保存为生产训练数据；
-在 scripted annotator 实现前，保存检查会 fail closed。
+此命令同时启用实时 FSM 和按 `e` 后的离线标注。push 只有达到 FurnitureBench
+几何目标才转入 leg pick，不以松爪代替；各装配步骤也必须满足几何判定。
 
 ```shell
 source ~/.bashrc
@@ -500,13 +522,15 @@ cd /home/hz/code/YueHu_deoxys
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
+  --latency-profile /home/hz/code/robust-rearrangement-custom/src/real/latency_profile.measured_20260908.json \
   --controller-type OSC_POSE \
   --annotation-source scripted \
-  --output-suffix round-table-diagnostic-202609 \
+  --output-suffix round-table-fsm-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --task-name round_table \
   --draw-part-poses \
+  --real-skill-annotation \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
   --prompt-depth-cameras both \
@@ -515,10 +539,11 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 ```
 
 front 预览会绘制 `P0 round_table_top`、`P1 round_table_leg` 和
-`P2 round_table_base`。首次按 `b` 前应确认 `valid=111`；数据分别保存到：
+`P2 round_table_base`。首次按 `b` 前建议确认 `valid=111`。完整数据保存在
+`<output-suffix>/{success|failure}/`；标注或其他质量检查失败时仍可保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/<output-suffix>/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/<output-suffix>/incomplete/{success|failure}/
 ```
 
 ### Lamp 数采（默认配置，可直接复制）
@@ -526,9 +551,8 @@ $DATA_DIR_RAW/raw/osc/real/round_table/teleop/low/<output-suffix>/{success|failu
 先完成 `--target lamp` 的相机与零件初始位置 setup，再运行下面的命令。相机
 profile、记录频率和 PromptDA 沿用当前默认值：
 
-`real_skill_annotation_util` 目前只支持 `one_leg`，因此 Lamp 命令不要添加
-`--real-skill-annotation`。这条命令当前只用于相机/控制诊断，不能保存为生产训练数据；
-在 scripted annotator 实现前，保存检查会 fail closed。
+此命令同时启用实时 FSM 和按 `e` 后的离线标注。base push 只有达到几何目标
+才进入 bulb pick；bulb 和 hood 的装配完成也要求对应的几何判定。
 
 ```shell
 source ~/.bashrc
@@ -537,13 +561,15 @@ cd /home/hz/code/YueHu_deoxys
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
+  --latency-profile /home/hz/code/robust-rearrangement-custom/src/real/latency_profile.measured_20260908.json \
   --controller-type OSC_POSE \
   --annotation-source scripted \
-  --output-suffix lamp-diagnostic-202609 \
+  --output-suffix lamp-fsm-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --task-name lamp \
   --draw-part-poses \
+  --real-skill-annotation \
   --prompt-depth-anything \
   --prompt-depth-model vitl \
   --prompt-depth-cameras both \
@@ -552,10 +578,11 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 ```
 
 front 预览会绘制 `P0 lamp_base`、`P1 lamp_bulb` 和 `P2 lamp_hood`。首次按
-`b` 前应确认 `valid=111`；数据分别保存到：
+`b` 前建议确认 `valid=111`。完整数据保存在
+`<output-suffix>/{success|failure}/`；标注或其他质量检查失败时仍可保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/<output-suffix>/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/<output-suffix>/incomplete/{success|failure}/
 ```
 
 ### 完整参数命令（与默认配置相同）
@@ -565,9 +592,10 @@ $DATA_DIR_RAW/raw/osc/real/lamp/teleop/low/<output-suffix>/{success|failure}/
 ```shell
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
+  --latency-profile /home/hz/code/robust-rearrangement-custom/src/real/latency_profile.measured_20260908.json \
   --controller-type OSC_POSE \
   --annotation-source scripted \
-  --output-suffix one-leg-v6-scripted-rgbd-202609 \
+  --output-suffix one-leg-umi-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --front-color-width 1280 \
@@ -610,41 +638,63 @@ Rodrigues 和 `cv2.drawFrameAxes` 投影流程。绿色 `FOUND` 表示当前帧�
 
 按键：`b` 开始、`e` 结束、`s` 保存为成功、`f` 保存为失败、`d` 丢弃、`r` 关节
 复位、`p` 实时开关 part-pose 绘制、`q` 退出。OpenCV 预览窗口获得焦点时这些按键
-同样有效。`one_leg` 只有得到 tabletop 和可动腿的位姿才允许开始录制；
-`round_table` 和 `lamp` 都要求各自三个零件全部有效。短暂的 AprilTag 遮挡会保留
+同样有效。建议 `one_leg` 的 tabletop 与可动腿、`round_table` 和 `lamp` 各自三个
+零件尽量全部有效；即使缺失也允许开始录制和保存，但会在质量日志中标为问题。
+短暂的 AprilTag 遮挡会保留
 最后一次位姿，同时用 `parts_founds`、`parts_pose_valid` 和
 `parts_pose_age_ms` 标记是否为当前帧检测以及位姿新鲜度。
 
 预览和坐标轴只用于屏幕显示，不会写入 pickle RGB 或保存的 MP4。没有图形桌面或
-通过普通 SSH 启动时，添加 `--no-camera-preview`；该参数只关闭窗口，不影响相机
-采集和 `parts_poses` 计算。
+通过普通 SSH 启动时，添加 `--no-camera-preview`；该参数关闭窗口与在线预览 FSM，
+不影响相机采集、`parts_poses` 计算或按 `e` 后的离线标注。
 
-`one_leg` 命令中的 `--real-skill-annotation` 会调用同级仓库
+三个任务命令中的 `--real-skill-annotation` 会调用同级仓库
 `robust-rearrangement-custom/src/eval/real_skill_annotation_util.py` 的几何标注接口。
-front 预览会额外显示紫色 guidance point，以及当前 `skill/skill_state`；这些图形只画
-在预览副本上，不会污染保存的原始 RGB。预览标注不进入 pickle；按 `e` 完成时间匹配
-后，脚本新建 `mode=offline` session，严格按最终 observation 顺序重算全部标注。该参数
-目前只接受 `--task-name one_leg`。
+dashboard 的 front/wrist RGB 画面会分别标出可投影的紫色目标点；白色的
+`FSM: skill / skill_state` 与两路目标像素坐标显示在 wrist 画面的
+`state=...` 下一行及其下方，不加底色。无法投影的点显示为 `--`；未启用、
+还没有可用位姿或标注异常会显示 `FSM: OFF/WAITING/ERROR`，不会静默留白。
+这些图形只画在预览副本上，不会污染保存的原始 RGB。预览标注不进入 pickle；按 `e` 完成时间匹配
+后，脚本新建 `mode=offline` session，严格按最终 observation 顺序重算全部标注。
+RR 真机 annotator 支持 `one_leg`、`round_table` 和 `lamp`；实时预览与最终 pickle
+分别运行独立的 FSM session。
 
-按 `b` 开始后，dashboard 会继续运行一套独立的实时 FSM，持续显示当前
-`skill/skill_state` 和 guidance point，方便确认遥操作阶段。它只消费当前预览帧，既不
+启用 `--real-skill-annotation` 后，按 `b` 开始时 dashboard 会重置并继续运行一套
+独立的实时 FSM，持续显示当前 `skill/skill_state` 和 guidance point，方便确认遥操作阶段。它只消费当前预览帧，既不
 写入 raw buffer，也不参与保存；按 `e` 后仍以对齐到 action 时间线的观测重新执行离线
 标注，离线结果是 pickle 中唯一的 ground truth。
 
-启用后，每个 observation 会保存 `skill`、`skill_state`、`assembly_step`、
+离线标注成功后，每个 observation 会保存 `skill`、`skill_state`、`assembly_step`、
 `guidance_point`、`guidance_pose`、`guidance_point_2d`、`grasp_annotation_2d` 和
-`real_annotation_debug`；pickle 根目录固定写入 `annotation_source=scripted`，并在
+`real_annotation_debug`；pickle 根目录写入 `annotation_source=scripted`，并在
 metadata 记录实现为 `real_skill_annotation_util`、`mode=offline`。最终标注或几何验证
-任一帧失败都会拒绝保存，不能把预览结果或 VLM prediction 当作 ground truth。
+失败时，或对齐、PromptDA、最终契约检查失败时，仍可按 `s`/`f` 保存；pickle 会
+显式标为 `incomplete`，不会把预览结果或 VLM prediction 冒充 ground truth。
+PromptDA 模型初始化失败时也会继续采原始 RGB-D，并在质量日志中记录初始化异常。
+特别是未加 `--real-skill-annotation` 时，即使对齐和 PromptDA 完成，也只会得到
+`unannotated` pickle。`round_table`/`lamp` 的真机推断中，障碍物使用 setup 时固定的
+标定位姿，来源记录在 `metadata.real_skill_annotation.obstacle_pose_source`。
+`metadata.real_skill_annotation.complete` 表示标注运行完成，`task_fsm_complete`
+单独表示全部装配步骤达到几何完成条件；两者不能混为一谈。
 
 原始 episode 保存到：
 
 ```text
-$DATA_DIR_RAW/raw/osc/real/<task-name>/teleop/low/{success|failure}/
+$DATA_DIR_RAW/raw/osc/real/<task-name>/teleop/low/<output-suffix>/{success|failure}/
 ```
 
 新 schema 每个 pickle 包含同为 `N` 个的 target-time observation、8 维 delta action
 和 reward；旧 schema 仍可能是 `N+1` observation / `N` action。
+每个 pickle 同目录另有同名 `.txt`，列出保存状态、每项错误、原始流数量和时序质量报告。
+完整数据仍是 `deoxys_furniturebench_raw_v6_offline_buffered`；有任何质量错误时
+schema 加 `_incomplete` 后缀并写入 `save_quality`。不完整文件单独放在
+`<output-suffix>/incomplete/{success|failure}/`，不会混入标准的
+`<output-suffix>/{success|failure}/`；使用递归 `--input-dir` 时仍须主动排除或重新处理。
+若连时序对齐都失败，pickle 仍保存 SpaceMouse/发送命令和原始相机、机器人、夹爪流，
+但 `observations/actions` 可能为空，不能直接用于训练。
+录制中若 `robot_interface.control()` 报错，脚本会停止继续发送动作并结束当前采集；
+按 `s`/`f` 仍可保存为不完整 pickle，然后按 `q` 退出并排查机械臂故障。
+无法启动相机/机器人而尚未按 `b`、磁盘不可写或空间不足时，不能保证生成文件。
 `color_image1`/`depth_image1` 是 wrist，`color_image2`/`depth_image2` 是 front。
 RGB 为 `240x320 uint8`，对齐到 RGB 的 depth 为正米制 `240x320 float16`。
 `parts_poses` 使用 FurnitureBench AprilTag 坐标系：`one_leg` 是 5 个零件加障碍物，
@@ -653,8 +703,9 @@ RGB 为 `240x320 uint8`，对齐到 RGB 的 depth 为正米制 `240x320 float16`
 `[dx, dy, dz, dqx, dqy, dqz, dqw, gripper]`：平移单位为米，
 四元数顺序为 `xyzw`，旋转是末端局部坐标系右乘 delta。
 
-正式数采默认按 USB 3.x/`5000M` 配置：front RGB-D 为 `1280x720@30`，wrist
-RGB-D 为 `640x480@30`。图像处理没有 `1280x720 -> 640x480 -> 320x240` 这样的
+当前默认配置为 front RGB-D `1280x720@30`（USB 3.x），wrist RGB
+`424x240@30`、depth `480x270@30`（USB 2.1）。图像处理没有
+`1280x720 -> 640x480 -> 320x240` 这样的
 两级缩放：
 
 - front AprilTag 始终直接使用原始 `1280x720` RGB。
@@ -662,8 +713,8 @@ RGB-D 为 `640x480@30`。图像处理没有 `1280x720 -> 640x480 -> 320x240` 这
   `INTER_AREA` 等比例缩小为 `320x240`；不会把 16:9 拉伸成 4:3。
 - front depth 先由 RealSense 对齐到 `1280x720` RGB 视角，再执行完全相同的裁剪，
   最后用 `INTER_NEAREST` 缩小为 `320x240`，避免生成不存在的深度插值值。
-- wrist 原图已经是 `640x480` 的 4:3，只用 `INTER_AREA` 等比例缩小为
-  `320x240`；wrist depth 使用相同几何变换和最近邻缩放。
+- wrist RGB 原图 `424x240` 在中间裁出 `320x240`，不缩放也不拉伸；对齐到
+  RGB 后的 wrist depth 使用相同裁剪窗口。
 
 `camera_info` 会同时保存每台相机的原始 color/depth profile、原始内参、裁剪窗口、
 缩放比例以及变换后的 `320x240` 内参。每个 observation 还保存本次启动重新估计的
@@ -709,9 +760,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
   --interface-cfg deoxys/config/charmander.yml \
+  --latency-profile /home/hz/code/robust-rearrangement-custom/src/real/latency_profile.measured_20260908.json \
   --controller-type OSC_POSE \
   --annotation-source scripted \
-  --output-suffix one-leg-v6-scripted-rgbd-202609 \
+  --output-suffix one-leg-umi-scripted-rgbd-202609 \
   --vendor-id 9583 \
   --spacemouse-connection wired \
   --record-image-width 320 \

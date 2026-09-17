@@ -537,9 +537,15 @@ class DualRealSenseSnapshotter:
         self._lock = threading.Lock()
         self._thread = None
         self._thread_error = None
+        self._tracker_thread = None
+        self._tracker_error = None
+        self._tracker_condition = threading.Condition()
+        self._tracker_input = None
+        self._latest_tracking = None
         self._latest = None
         self._history = deque(maxlen=max(2, int(history_size)))
         self._next_sequence = 0
+        self._duplicate_frame_counts = {"front": 0, "wrist": 0}
 
     def start(self):
         devices = connected_realsense_devices()
@@ -558,6 +564,13 @@ class DualRealSenseSnapshotter:
         except Exception:
             self.front.stop()
             raise
+        if self.tracker is not None:
+            self._tracker_thread = threading.Thread(
+                target=self._tracker_loop,
+                name="furniture_pose_tracker",
+                daemon=True,
+            )
+            self._tracker_thread.start()
         self._thread = threading.Thread(
             target=self._capture_loop,
             name="dual_realsense_snapshotter",
@@ -565,12 +578,43 @@ class DualRealSenseSnapshotter:
         )
         self._thread.start()
 
+    def _tracker_loop(self):
+        """Process only the newest front frame without throttling RGB-D capture."""
+
+        try:
+            while not self._stop_event.is_set():
+                with self._tracker_condition:
+                    self._tracker_condition.wait_for(
+                        lambda: self._tracker_input is not None
+                        or self._stop_event.is_set()
+                    )
+                    if self._stop_event.is_set():
+                        break
+                    color_bgr = self._tracker_input
+                    self._tracker_input = None
+                tracking = self.tracker.update(color_bgr, self.front.intrinsics)
+                with self._tracker_condition:
+                    self._latest_tracking = tracking
+        except Exception as exc:
+            self._tracker_error = exc
+
     def _capture_loop(self):
         try:
+            last_front_frame = None
+            last_wrist_frame = None
             while not self._stop_event.is_set():
                 front = self.front.read()
                 wrist = self.wrist.read()
                 if front is None or wrist is None:
+                    continue
+                front_frame = (front["frame_number"], front["sensor_timestamp_ms"])
+                wrist_frame = (wrist["frame_number"], wrist["sensor_timestamp_ms"])
+                duplicate_front = front_frame == last_front_frame
+                duplicate_wrist = wrist_frame == last_wrist_frame
+                if duplicate_front or duplicate_wrist:
+                    with self._lock:
+                        self._duplicate_frame_counts["front"] += int(duplicate_front)
+                        self._duplicate_frame_counts["wrist"] += int(duplicate_wrist)
                     continue
                 sample = {
                     "color_image1": cv2.cvtColor(
@@ -611,16 +655,32 @@ class DualRealSenseSnapshotter:
                     "capture_sequence": self._next_sequence,
                 }
                 if self.tracker is not None:
-                    sample.update(
-                        self.tracker.update(front["bgr"], self.front.intrinsics)
-                    )
+                    with self._tracker_condition:
+                        if self._latest_tracking is not None:
+                            sample.update(
+                                {
+                                    key: value.copy()
+                                    if isinstance(value, np.ndarray)
+                                    else value
+                                    for key, value in self._latest_tracking.items()
+                                }
+                            )
+                        # RealSenseCamera.read() already owns this copied array.
+                        # Pass the immutable frame by reference instead of doing
+                        # another 1280x720 memcpy on the capture thread.
+                        self._tracker_input = front["bgr"]
+                        self._tracker_condition.notify()
                 with self._lock:
                     self._latest = sample
                     self._history.append(sample)
                     self._next_sequence += 1
+                last_front_frame = front_frame
+                last_wrist_frame = wrist_frame
         except Exception as exc:
             self._thread_error = exc
             self._stop_event.set()
+            with self._tracker_condition:
+                self._tracker_condition.notify_all()
 
     def latest(self):
         if self._thread_error is not None:
@@ -628,10 +688,11 @@ class DualRealSenseSnapshotter:
         with self._lock:
             if self._latest is None:
                 return None
-            return {
-                key: value.copy() if isinstance(value, np.ndarray) else value
-                for key, value in self._latest.items()
-            }
+            latest = dict(self._latest)
+        return {
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in latest.items()
+        }
 
     def history_cursor(self):
         """Return the sequence number assigned to the next captured pair."""
@@ -640,6 +701,10 @@ class DualRealSenseSnapshotter:
             raise RuntimeError("dual RealSense capture failed") from self._thread_error
         with self._lock:
             return int(self._next_sequence)
+
+    def duplicate_frame_counts(self):
+        with self._lock:
+            return dict(self._duplicate_frame_counts)
 
     def samples_since(self, sequence):
         """Return every buffered pair at or after ``sequence`` plus a new cursor.
@@ -660,15 +725,17 @@ class DualRealSenseSnapshotter:
                         "dual RealSense history overflow: requested sequence "
                         f"{sequence}, oldest available is {oldest}"
                     )
+            # History entries are immutable after publication.  Only copy the
+            # mappings while holding the capture lock; the episode collector
+            # deep-copies arrays after releasing it so camera acquisition is
+            # never blocked by several megabytes of RGB-D memcpy.
             samples = [
-                {
-                    key: value.copy() if isinstance(value, np.ndarray) else value
-                    for key, value in sample.items()
-                }
+                dict(sample)
                 for sample in self._history
                 if int(sample["capture_sequence"]) >= sequence
             ]
-            return samples, int(self._next_sequence)
+            next_sequence = int(self._next_sequence)
+        return samples, next_sequence
 
     def metadata(self):
         return {
@@ -703,11 +770,20 @@ class DualRealSenseSnapshotter:
         """Stop capture before tearing down either native RealSense pipeline."""
 
         self._stop_event.set()
+        tracker_condition = getattr(self, "_tracker_condition", None)
+        if tracker_condition is not None:
+            with tracker_condition:
+                tracker_condition.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 return False
             self._thread = None
+        if getattr(self, "_tracker_thread", None) is not None:
+            self._tracker_thread.join(timeout=timeout)
+            if self._tracker_thread.is_alive():
+                return False
+            self._tracker_thread = None
         self.wrist.stop()
         self.front.stop()
         return True

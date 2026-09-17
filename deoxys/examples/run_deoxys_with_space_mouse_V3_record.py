@@ -2,12 +2,15 @@
 
 import argparse
 import concurrent.futures
+import json
 import os
 import pickle
 import select
 import sys
 import termios
+import threading
 import time
+import traceback
 import tty
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +37,6 @@ from deoxys.utils.io_devices import SpaceMouse
 from deoxys.utils.log_utils import get_deoxys_example_logger
 from deoxys.utils.machine_time import (
     MachineTimeSchedule,
-    monotonic_target_to_wall_time_ns,
 )
 from deoxys.utils.prompt_depth_anything import (
     PromptDepthAnythingEstimator,
@@ -519,6 +521,30 @@ def _copy_mapping_arrays(value):
     }
 
 
+def _serializable_raw_state_records(records):
+    """Preserve protobuf state bytes when alignment fails; protobufs cannot pickle."""
+    serialized = []
+    for record in records:
+        copied = _copy_mapping_arrays(record)
+        message = copied.get("message")
+        if hasattr(message, "SerializeToString"):
+            copied.pop("message")
+            copied["message_proto_type"] = getattr(
+                getattr(message, "DESCRIPTOR", None),
+                "full_name",
+                type(message).__name__,
+            )
+            try:
+                copied["message_proto_bytes"] = message.SerializeToString()
+            except Exception as exc:
+                copied["message_serialization_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                copied["message_repr"] = repr(message)
+        serialized.append(copied)
+    return serialized
+
+
 def _residual_summary(values_ns):
     values_ms = np.asarray(values_ns, dtype=np.float64) / 1e6
     if values_ms.size == 0:
@@ -532,8 +558,10 @@ def _residual_summary(values_ns):
     }
 
 
-def _nearest_unique_matches(target_times_ns, source_items, max_residual_ns, label):
-    """Greedily match dense, ordered source samples without reusing a frame."""
+def _nearest_unique_matches(
+    target_times_ns, source_items, max_residual_ns, label, *, require_unique=True
+):
+    """Match ordered samples; only camera frames must be consumed uniquely."""
 
     ordered = sorted(source_items, key=lambda item: item[0])
     source_times = np.asarray([item[0] for item in ordered], dtype=np.int64)
@@ -547,9 +575,10 @@ def _nearest_unique_matches(target_times_ns, source_items, max_residual_ns, labe
     previous_index = -1
     for target_time_ns in target_times_ns:
         insertion = int(np.searchsorted(source_times, int(target_time_ns)))
+        first_allowed = previous_index + 1 if require_unique else 0
         candidates = {
-            max(previous_index + 1, insertion - 1),
-            max(previous_index + 1, insertion),
+            max(first_allowed, insertion - 1),
+            max(first_allowed, insertion),
         }
         candidates = [index for index in candidates if index < len(ordered)]
         if not candidates:
@@ -570,6 +599,117 @@ def _nearest_unique_matches(target_times_ns, source_items, max_residual_ns, labe
         residuals.append(residual_ns)
         previous_index = index
     return selected, residuals
+
+
+def _nearest_joint_camera_matches(
+    target_times_ns,
+    front_items,
+    wrist_items,
+    warning_residual_ns,
+    warning_skew_ns,
+    hard_gap_ns=200_000_000,
+):
+    """Choose the nearest camera pair and allow reuse across 10 Hz steps.
+
+    UMI-style downsampling repeats a source frame when a camera drops a frame.
+    A coverage gap is reported as an incomplete-quality warning, but does not
+    prevent the remaining observations and offline depth processing.
+    """
+
+    front = sorted(front_items, key=lambda item: item[0])
+    wrist = sorted(wrist_items, key=lambda item: item[0])
+    front_times = np.asarray([item[0] for item in front], dtype=np.int64)
+    wrist_times = np.asarray([item[0] for item in wrist], dtype=np.int64)
+    for name, times in (("front", front_times), ("wrist", wrist_times)):
+        if not len(times):
+            raise RuntimeError(f"{name}_camera: source buffer is empty")
+        if np.any(np.diff(times) <= 0):
+            raise RuntimeError(f"{name}_camera: source timestamps are not strictly increasing")
+
+    selected_front = []
+    selected_wrist = []
+    front_residuals = []
+    wrist_residuals = []
+    pair_skews = []
+    warning_steps = []
+    for step, target in enumerate(target_times_ns):
+        target = int(target)
+        front_start = max(
+            0,
+            int(np.searchsorted(front_times, target - hard_gap_ns)),
+        )
+        wrist_start = max(
+            0,
+            int(np.searchsorted(wrist_times, target - hard_gap_ns)),
+        )
+        front_end = int(
+            np.searchsorted(front_times, target + hard_gap_ns, side="right")
+        )
+        wrist_end = int(
+            np.searchsorted(wrist_times, target + hard_gap_ns, side="right")
+        )
+        front_candidates = list(range(front_start, front_end))
+        wrist_candidates = list(range(wrist_start, wrist_end))
+        if not front_candidates:
+            front_candidates = [int(np.argmin(np.abs(front_times - target)))]
+        if not wrist_candidates:
+            wrist_candidates = [int(np.argmin(np.abs(wrist_times - target)))]
+        pairs = [
+            (front_index, wrist_index)
+            for front_index in front_candidates
+            for wrist_index in wrist_candidates
+        ]
+        front_index, wrist_index = min(
+            pairs,
+            key=lambda pair: (
+                abs(int(front_times[pair[0]]) - target)
+                + abs(int(wrist_times[pair[1]]) - target),
+                abs(int(front_times[pair[0]]) - int(wrist_times[pair[1]])),
+            ),
+        )
+        selected_front.append(front[front_index])
+        selected_wrist.append(wrist[wrist_index])
+        front_residuals.append(abs(int(front_times[front_index]) - target))
+        wrist_residuals.append(abs(int(wrist_times[wrist_index]) - target))
+        pair_skews.append(
+            abs(int(front_times[front_index]) - int(wrist_times[wrist_index]))
+        )
+        if (
+            front_residuals[-1] > int(warning_residual_ns)
+            or wrist_residuals[-1] > int(warning_residual_ns)
+            or pair_skews[-1] > int(warning_skew_ns)
+        ):
+            warning_steps.append(step)
+    return (
+        selected_front,
+        selected_wrist,
+        front_residuals,
+        wrist_residuals,
+        pair_skews,
+        warning_steps,
+    )
+
+
+def _causal_latest_matches(target_times_ns, records, effect_time_key, label):
+    """Return the latest command already effective at every target time."""
+
+    ordered = sorted(records, key=lambda item: int(item[effect_time_key]))
+    if not ordered:
+        raise RuntimeError(f"{label}: source buffer is empty")
+    effect_times = np.asarray(
+        [int(item[effect_time_key]) for item in ordered], dtype=np.int64
+    )
+    if np.any(np.diff(effect_times) < 0):
+        raise RuntimeError(f"{label}: effect timestamps are not increasing")
+    matches = []
+    ages = []
+    for target_time_ns in target_times_ns:
+        index = int(np.searchsorted(effect_times, int(target_time_ns), side="right")) - 1
+        if index < 0:
+            raise RuntimeError(f"{label}: no command is effective at the first target")
+        matches.append(ordered[index])
+        ages.append(int(target_time_ns) - int(effect_times[index]))
+    return matches, ages
 
 
 def _camera_source_items(camera_samples, camera_name, camera_info):
@@ -647,14 +787,10 @@ def _interpolated_robot_record(
     if insertion == 0 or insertion == len(ordered):
         index = 0 if insertion == 0 else len(ordered) - 1
         residual_ns = abs(int(effective_times[index]) - target_time_ns)
-        if residual_ns > int(max_residual_ns):
-            raise RuntimeError(
-                "robot_state: edge residual "
-                f"{residual_ns / 1e6:.3f} ms exceeds {max_residual_ns / 1e6:.3f} ms"
-            )
         return ordered[index], {
             "mode": "nearest_edge",
             "residual_ns": residual_ns,
+            "quality_warning": residual_ns > int(max_residual_ns),
             "source_receive_wall_time_ns": int(
                 ordered[index]["receive_wall_time_ns"]
             ),
@@ -665,12 +801,6 @@ def _interpolated_robot_record(
     left_time = int(effective_times[left_index])
     right_time = int(effective_times[right_index])
     nearest_residual_ns = min(target_time_ns - left_time, right_time - target_time_ns)
-    if nearest_residual_ns > int(max_residual_ns):
-        raise RuntimeError(
-            "robot_state: bracket residual "
-            f"{nearest_residual_ns / 1e6:.3f} ms exceeds "
-            f"{max_residual_ns / 1e6:.3f} ms"
-        )
     alpha = (target_time_ns - left_time) / float(right_time - left_time)
     left_message = ordered[left_index]["message"]
     right_message = ordered[right_index]["message"]
@@ -708,6 +838,7 @@ def _interpolated_robot_record(
     return record, {
         "mode": "linear_translation_joint_slerp_rotation",
         "residual_ns": int(nearest_residual_ns),
+        "quality_warning": nearest_residual_ns > int(max_residual_ns),
         "left_receive_wall_time_ns": int(
             ordered[left_index]["receive_wall_time_ns"]
         ),
@@ -718,7 +849,104 @@ def _interpolated_robot_record(
     }
 
 
-def materialize_buffered_episode(
+def _interpolated_gripper_record(
+    gripper_records,
+    target_time_ns,
+    latency_ns,
+    max_residual_ns,
+):
+    """Interpolate continuous gripper width on the corrected state timeline."""
+
+    ordered = sorted(
+        gripper_records,
+        key=lambda record: int(record["receive_wall_time_ns"]),
+    )
+    effective_times = np.asarray(
+        [int(record["receive_wall_time_ns"]) - int(latency_ns) for record in ordered],
+        dtype=np.int64,
+    )
+    if not len(effective_times):
+        raise RuntimeError("gripper_state: source buffer is empty")
+    if np.any(np.diff(effective_times) <= 0):
+        raise RuntimeError("gripper_state: timestamps are not strictly increasing")
+    target_time_ns = int(target_time_ns)
+    insertion = int(np.searchsorted(effective_times, target_time_ns))
+    if insertion == 0 or insertion == len(ordered):
+        index = 0 if insertion == 0 else len(ordered) - 1
+        residual_ns = abs(int(effective_times[index]) - target_time_ns)
+        return ordered[index], {
+            "mode": "nearest_edge",
+            "residual_ns": residual_ns,
+            "quality_warning": residual_ns > int(max_residual_ns),
+            "source_receive_wall_time_ns": int(
+                ordered[index]["receive_wall_time_ns"]
+            ),
+        }
+
+    left_index = insertion - 1
+    right_index = insertion
+    left_time = int(effective_times[left_index])
+    right_time = int(effective_times[right_index])
+    residual_ns = min(target_time_ns - left_time, right_time - target_time_ns)
+    alpha = (target_time_ns - left_time) / float(right_time - left_time)
+    left_width = _gripper_width_from_record(ordered[left_index])
+    right_width = _gripper_width_from_record(ordered[right_index])
+    width = (1.0 - alpha) * left_width + alpha * right_width
+    left_message = ordered[left_index]["message"]
+    right_message = ordered[right_index]["message"]
+    left_source_time = _message_time_seconds(left_message)
+    right_source_time = _message_time_seconds(right_message)
+    source_time = None
+    if left_source_time is not None and right_source_time is not None:
+        source_time = (1.0 - alpha) * left_source_time + alpha * right_source_time
+    record = {
+        "message": SimpleNamespace(width=float(width), time=source_time),
+        "receive_wall_time_ns": target_time_ns + int(latency_ns),
+    }
+    return record, {
+        "mode": "linear_width",
+        "residual_ns": int(residual_ns),
+        "quality_warning": residual_ns > int(max_residual_ns),
+        "left_receive_wall_time_ns": int(
+            ordered[left_index]["receive_wall_time_ns"]
+        ),
+        "right_receive_wall_time_ns": int(
+            ordered[right_index]["receive_wall_time_ns"]
+        ),
+        "alpha": float(alpha),
+    }
+
+
+def _absolute_wrist_target_to_action(absolute_wrist_action, robot_state, eepose_frame):
+    """Convert an absolute wrist target into the existing 8-D RR delta action."""
+
+    absolute_wrist_action = np.asarray(absolute_wrist_action, dtype=np.float64).reshape(7)
+    target_wrist_pose = np.eye(4, dtype=np.float64)
+    target_wrist_pose[:3, 3] = absolute_wrist_action[:3]
+    target_wrist_pose[:3, :3] = Rotation.from_rotvec(
+        absolute_wrist_action[3:6]
+    ).as_matrix()
+    target_pose = eepose_from_wrist_pose(target_wrist_pose, eepose_frame)
+    current_pose = np.asarray(robot_state["ee_pose"], dtype=np.float64).reshape(4, 4)
+    relative_rotation = current_pose[:3, :3].T @ target_pose[:3, :3]
+    action = np.concatenate(
+        [
+            target_pose[:3, 3] - current_pose[:3, 3],
+            transform_utils.mat2quat(relative_rotation),
+            [float(np.sign(absolute_wrist_action[-1]))],
+        ]
+    )
+    action_absolute = np.concatenate(
+        [
+            target_pose[:3, 3],
+            transform_utils.mat2quat(target_pose[:3, :3]),
+            [float(np.sign(absolute_wrist_action[-1]))],
+        ]
+    )
+    return action.astype(np.float32), action_absolute.astype(np.float32)
+
+
+def _materialize_buffered_episode_v6(
     action_records,
     camera_samples,
     robot_records,
@@ -763,28 +991,19 @@ def materialize_buffered_episode(
     wrist_items, wrist_time_source = _camera_source_items(
         camera_samples, "wrist", camera_info
     )
-    front_matches, front_residuals = _nearest_unique_matches(
+    (
+        front_matches,
+        wrist_matches,
+        front_residuals,
+        wrist_residuals,
+        pair_skews,
+    ) = _nearest_joint_camera_matches(
         target_times,
         front_items,
-        camera_max_residual_ns,
-        "front_camera",
-    )
-    wrist_matches, wrist_residuals = _nearest_unique_matches(
-        target_times,
         wrist_items,
         camera_max_residual_ns,
-        "wrist_camera",
+        camera_pair_max_skew_ns,
     )
-    pair_skews = [
-        abs(int(front[0]) - int(wrist[0]))
-        for front, wrist in zip(front_matches, wrist_matches)
-    ]
-    if pair_skews and max(pair_skews) > int(camera_pair_max_skew_ns):
-        raise RuntimeError(
-            "front/wrist pair skew "
-            f"{max(pair_skews) / 1e6:.3f} ms exceeds "
-            f"{camera_pair_max_skew_ns / 1e6:.3f} ms"
-        )
 
     gripper_items = [
         (
@@ -798,6 +1017,7 @@ def materialize_buffered_episode(
         gripper_items,
         gripper_max_residual_ns,
         "gripper_state",
+        require_unique=False,
     )
 
     observations = []
@@ -873,6 +1093,323 @@ def materialize_buffered_episode(
         "front_wrist_skew": _residual_summary(pair_skews),
         "robot_residual": _residual_summary(robot_residuals),
         "gripper_residual": _residual_summary(gripper_residuals),
+        "gripper_reused_steps": sum(
+            current[1] is previous[1]
+            for previous, current in zip(gripper_matches, gripper_matches[1:])
+        ),
+    }
+    return {
+        "observations": observations,
+        "actions": actions,
+        "actions_original": actions_original,
+        "actions_absolute": actions_absolute,
+        "action_timing": action_timing,
+        "report": report,
+    }
+
+
+def materialize_buffered_episode(
+    arm_action_records,
+    gripper_action_records,
+    camera_samples,
+    robot_records,
+    gripper_records,
+    *,
+    grid_start_wall_time_ns,
+    grid_end_wall_time_ns,
+    camera_info,
+    eepose_frame,
+    action_period_ns,
+    camera_max_residual_ns,
+    camera_pair_max_skew_ns,
+    robot_max_residual_ns,
+    gripper_max_residual_ns,
+    camera_hard_gap_ns=200_000_000,
+    robot_latency_ns=0,
+    gripper_latency_ns=0,
+):
+    """Materialize asynchronous raw streams on a fixed 10 Hz timeline."""
+
+    if not arm_action_records:
+        raise RuntimeError("no successful absolute arm commands were buffered")
+    if not gripper_action_records:
+        raise RuntimeError("no gripper command state was buffered")
+    grid_start_wall_time_ns = int(grid_start_wall_time_ns)
+    grid_end_wall_time_ns = int(grid_end_wall_time_ns)
+    if grid_end_wall_time_ns < grid_start_wall_time_ns:
+        raise RuntimeError("episode grid end precedes its start")
+
+    front_items, front_time_source = _camera_source_items(
+        camera_samples, "front", camera_info
+    )
+    wrist_items, wrist_time_source = _camera_source_items(
+        camera_samples, "wrist", camera_info
+    )
+    if not front_items or not wrist_items or not robot_records or not gripper_records:
+        raise RuntimeError("one or more observation buffers are empty")
+    robot_effective_times = [
+        int(record["receive_wall_time_ns"]) - int(robot_latency_ns)
+        for record in robot_records
+    ]
+    gripper_state_effective_times = [
+        int(record["receive_wall_time_ns"]) - int(gripper_latency_ns)
+        for record in gripper_records
+    ]
+    coverage_start_ns = max(
+        grid_start_wall_time_ns,
+        min(time_ns for time_ns, _ in front_items) - int(camera_hard_gap_ns),
+        min(time_ns for time_ns, _ in wrist_items) - int(camera_hard_gap_ns),
+        min(robot_effective_times) - int(robot_max_residual_ns),
+        min(gripper_state_effective_times) - int(gripper_max_residual_ns),
+        min(int(record["predicted_effect_wall_time_ns"]) for record in arm_action_records),
+        min(
+            int(record["predicted_effect_wall_time_ns"])
+            for record in gripper_action_records
+        ),
+    )
+    coverage_end_ns = min(
+        grid_end_wall_time_ns,
+        max(time_ns for time_ns, _ in front_items) + int(camera_hard_gap_ns),
+        max(time_ns for time_ns, _ in wrist_items) + int(camera_hard_gap_ns),
+        max(robot_effective_times) + int(robot_max_residual_ns),
+        max(gripper_state_effective_times) + int(gripper_max_residual_ns),
+    )
+    first_grid_index = max(
+        0,
+        int(
+            np.ceil(
+                (coverage_start_ns - grid_start_wall_time_ns)
+                / float(action_period_ns)
+            )
+        ),
+    )
+    last_grid_index = int(
+        np.floor(
+            (coverage_end_ns - grid_start_wall_time_ns) / float(action_period_ns)
+        )
+    )
+    if last_grid_index < first_grid_index:
+        raise RuntimeError("raw streams have no common fixed-rate coverage")
+    target_times = (
+        grid_start_wall_time_ns
+        + np.arange(first_grid_index, last_grid_index + 1, dtype=np.int64)
+        * int(action_period_ns)
+    )
+    target_intervals = np.diff(target_times)
+
+    (
+        front_matches,
+        wrist_matches,
+        front_residuals,
+        wrist_residuals,
+        pair_skews,
+        camera_warning_steps,
+    ) = _nearest_joint_camera_matches(
+        target_times,
+        front_items,
+        wrist_items,
+        camera_max_residual_ns,
+        camera_pair_max_skew_ns,
+        camera_hard_gap_ns,
+    )
+    arm_matches, arm_action_ages = _causal_latest_matches(
+        target_times,
+        arm_action_records,
+        "predicted_effect_wall_time_ns",
+        "arm_action",
+    )
+    gripper_action_matches, gripper_action_ages = _causal_latest_matches(
+        target_times,
+        gripper_action_records,
+        "predicted_effect_wall_time_ns",
+        "gripper_action",
+    )
+
+    observations = []
+    actions = []
+    actions_original = []
+    actions_absolute = []
+    action_timing = []
+    robot_residuals = []
+    gripper_state_residuals = []
+    robot_state_warning_steps = []
+    gripper_state_warning_steps = []
+    for index, (
+        arm_record,
+        gripper_action_record,
+        front_match,
+        wrist_match,
+    ) in enumerate(
+        zip(
+            arm_matches,
+            gripper_action_matches,
+            front_matches,
+            wrist_matches,
+        )
+    ):
+        target_time_ns = int(target_times[index])
+        robot_record, robot_match = _interpolated_robot_record(
+            robot_records,
+            target_time_ns,
+            robot_latency_ns,
+            robot_max_residual_ns,
+        )
+        robot_residuals.append(robot_match["residual_ns"])
+        if robot_match["quality_warning"]:
+            robot_state_warning_steps.append(index)
+        gripper_record, gripper_state_match = _interpolated_gripper_record(
+            gripper_records,
+            target_time_ns,
+            gripper_latency_ns,
+            gripper_max_residual_ns,
+        )
+        gripper_state_residuals.append(gripper_state_match["residual_ns"])
+        if gripper_state_match["quality_warning"]:
+            gripper_state_warning_steps.append(index)
+        camera_sample = _compose_camera_sample(
+            front_match,
+            wrist_match,
+            target_time_ns,
+        )
+        observation = build_observation_from_records(
+            robot_record,
+            gripper_record,
+            camera_sample,
+            eepose_frame=eepose_frame,
+        )
+        if observation is None:
+            raise RuntimeError(f"could not build aligned observation {index}")
+        observation["control_wall_time_ns"] = target_time_ns
+        observation["observation_target_wall_time_ns"] = target_time_ns
+        observation["offline_alignment"] = {
+            "front_residual_ms": front_residuals[index] / 1e6,
+            "wrist_residual_ms": wrist_residuals[index] / 1e6,
+            "front_wrist_skew_ms": pair_skews[index] / 1e6,
+            "camera_quality_warning": index in camera_warning_steps,
+            "robot_state": robot_match,
+            "gripper_state": gripper_state_match,
+        }
+
+        if arm_record.get("scaled_physical_delta") is not None:
+            scaled_action = np.asarray(
+                arm_record["scaled_physical_delta"], dtype=np.float64
+            ).copy()
+            scaled_action[-1] = float(
+                np.sign(gripper_action_record["gripper_action"])
+            )
+            action = deoxys_delta_to_furniture_bench_action(
+                scaled_action,
+                observation["robot_state"]["wrist_pose"],
+                eepose_frame,
+            )
+            action_original = deoxys_delta_to_furniture_bench_action(
+                scaled_action,
+                observation["robot_state"]["wrist_pose"],
+                "original",
+            )
+            action_absolute = delta_action_to_absolute(
+                action,
+                observation["robot_state"],
+            ).astype(np.float32)
+        else:
+            absolute_wrist_action = np.asarray(
+                arm_record["absolute_wrist_action"], dtype=np.float64
+            ).copy()
+            absolute_wrist_action[-1] = float(
+                np.sign(gripper_action_record["gripper_action"])
+            )
+            action, action_absolute = _absolute_wrist_target_to_action(
+                absolute_wrist_action,
+                observation["robot_state"],
+                eepose_frame,
+            )
+            action_original, _ = _absolute_wrist_target_to_action(
+                absolute_wrist_action,
+                observation["robot_state"],
+                "original",
+            )
+        observations.append(observation)
+        actions.append(action)
+        actions_original.append(action_original)
+        actions_absolute.append(action_absolute)
+        action_timing.append(
+            {
+                "action_target_wall_time_ns": target_time_ns,
+                "action_wall_time_ns": target_time_ns,
+                "episode_grid_start_wall_time_ns": grid_start_wall_time_ns,
+                "grid_index": first_grid_index + index,
+                "action_period_ns": int(action_period_ns),
+                "status": "materialized",
+                "arm_source_sample_wall_time_ns": arm_record.get(
+                    "sample_wall_time_ns"
+                ),
+                "arm_source_command_wall_time_ns": arm_record.get(
+                    "command_wall_time_ns"
+                ),
+                "arm_source_effect_wall_time_ns": int(
+                    arm_record["predicted_effect_wall_time_ns"]
+                ),
+                "arm_action_age_ms": arm_action_ages[index] / 1e6,
+                "gripper_source_command_wall_time_ns": gripper_action_record.get(
+                    "command_wall_time_ns"
+                ),
+                "gripper_source_effect_wall_time_ns": int(
+                    gripper_action_record["predicted_effect_wall_time_ns"]
+                ),
+                "gripper_action_age_ms": gripper_action_ages[index] / 1e6,
+                "camera_quality_warning": index in camera_warning_steps,
+                "robot_state_alignment": robot_match,
+                "gripper_state_alignment": gripper_state_match,
+                "offline_alignment_index": index,
+            }
+        )
+
+    report = {
+        "mode": "umi_style_absolute_command_effect_time_alignment",
+        "grid_start_wall_time_ns": grid_start_wall_time_ns,
+        "grid_end_wall_time_ns": grid_end_wall_time_ns,
+        "first_materialized_grid_index": first_grid_index,
+        "last_materialized_grid_index": last_grid_index,
+        "trimmed_leading_ms": (
+            int(target_times[0]) - grid_start_wall_time_ns
+        ) / 1e6,
+        "trimmed_trailing_ms": (
+            grid_end_wall_time_ns - int(target_times[-1])
+        ) / 1e6,
+        "num_raw_arm_commands": len(arm_action_records),
+        "num_raw_gripper_commands": len(gripper_action_records),
+        "num_buffered_camera_pairs": len(camera_samples),
+        "num_buffered_robot_states": len(robot_records),
+        "num_buffered_gripper_states": len(gripper_records),
+        "num_materialized_steps": len(observations),
+        "target_interval": _residual_summary(target_intervals),
+        "front_time_source": front_time_source,
+        "wrist_time_source": wrist_time_source,
+        "front_residual": _residual_summary(front_residuals),
+        "wrist_residual": _residual_summary(wrist_residuals),
+        "front_wrist_skew": _residual_summary(pair_skews),
+        "camera_warning_steps": camera_warning_steps,
+        "camera_hard_gap_steps": [
+            index
+            for index, (front_residual, wrist_residual) in enumerate(
+                zip(front_residuals, wrist_residuals)
+            )
+            if max(front_residual, wrist_residual) > int(camera_hard_gap_ns)
+        ],
+        "camera_reused_front_steps": sum(
+            current[1] is previous[1]
+            for previous, current in zip(front_matches, front_matches[1:])
+        ),
+        "camera_reused_wrist_steps": sum(
+            current[1] is previous[1]
+            for previous, current in zip(wrist_matches, wrist_matches[1:])
+        ),
+        "robot_residual": _residual_summary(robot_residuals),
+        "gripper_state_residual": _residual_summary(gripper_state_residuals),
+        "robot_state_warning_steps": robot_state_warning_steps,
+        "gripper_state_warning_steps": gripper_state_warning_steps,
+        "arm_action_age": _residual_summary(arm_action_ages),
+        "gripper_action_age": _residual_summary(gripper_action_ages),
     }
     return {
         "observations": observations,
@@ -910,11 +1447,17 @@ def apply_prompt_depth_offline(observations, estimator, cameras):
                 last_usable_depth[camera_name] = raw_depth
             else:
                 prompt_depth = last_usable_depth.get(camera_name)
-            enhanced, stats = estimator.enhance(
-                observation[color_key],
-                raw_depth,
-                prompt_depth_m=prompt_depth,
-            )
+            try:
+                enhanced, stats = estimator.enhance(
+                    observation[color_key],
+                    raw_depth,
+                    prompt_depth_m=prompt_depth,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"PromptDA frame {frame_index} {camera_name}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             if enhanced.shape != raw_depth.shape:
                 raise RuntimeError(
                     f"PromptDA frame {frame_index} {depth_key} shape mismatch: "
@@ -1049,57 +1592,84 @@ def _draw_front_part_poses(
     return preview
 
 
-def _draw_real_skill_annotation(front_bgr, observation):
-    """Draw the live guidance point and skill without mutating recorded RGB."""
-    preview = front_bgr.copy()
-    if not observation:
+def _draw_real_skill_annotation(
+    image_bgr, observation, image_key="color_image2", status=None, show_text=False
+):
+    """Draw this camera's live target and optional FSM text on a preview copy."""
+    preview = image_bgr.copy()
+    if not observation and status is None:
         return preview
 
     point = None
-    projections = observation.get("guidance_point_2d")
+    projections = observation.get("guidance_point_2d") if observation else None
     if isinstance(projections, dict):
-        point = projections.get("color_image2")
+        point = projections.get(image_key)
+    marker_xy = None
     if point is not None:
         point = np.asarray(point, dtype=np.float64).reshape(-1)
         if point.size == 2 and np.all(np.isfinite(point)):
-            source = observation.get("color_image2")
+            source = observation.get(image_key)
             source_height, source_width = preview.shape[:2]
             if isinstance(source, np.ndarray) and source.ndim >= 2:
                 source_height, source_width = source.shape[:2]
             x = int(round(point[0] * preview.shape[1] / source_width))
             y = int(round(point[1] * preview.shape[0] / source_height))
             if 0 <= x < preview.shape[1] and 0 <= y < preview.shape[0]:
-                cv2.drawMarker(
-                    preview,
-                    (x, y),
-                    (255, 0, 255),
-                    markerType=cv2.MARKER_CROSS,
-                    markerSize=18,
-                    thickness=2,
-                    line_type=cv2.LINE_AA,
-                )
-                cv2.circle(preview, (x, y), 8, (255, 255, 255), 2, cv2.LINE_AA)
-
-    skill = observation.get("skill")
-    skill_state = observation.get("skill_state")
-    if isinstance(skill, bytes):
-        skill = skill.decode("utf-8")
-    if isinstance(skill_state, bytes):
-        skill_state = skill_state.decode("utf-8")
-    if skill is not None:
-        label = f"annotation={skill}"
-        if skill_state is not None:
-            label += f"/{skill_state}"
+                marker_xy = (x, y)
+    if show_text:
+        skill = observation.get("skill") if observation else None
+        skill_state = observation.get("skill_state") if observation else None
+        if isinstance(skill, bytes):
+            skill = skill.decode("utf-8")
+        if isinstance(skill_state, bytes):
+            skill_state = skill_state.decode("utf-8")
+        label = f"FSM: {skill or 'NONE'}"
+        if skill_state:
+            label += f" / {skill_state}"
+        if not observation:
+            label = f"FSM: {status or 'WAITING'}"
         cv2.putText(
             preview,
             label,
-            (8, 60),
+            (8, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 0, 255),
+            0.42,
+            (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
+        if observation:
+            def point_text(key):
+                value = projections.get(key) if isinstance(projections, dict) else None
+                if value is None:
+                    return "--"
+                value = np.asarray(value, dtype=np.float64).reshape(-1)
+                if value.size != 2 or not np.all(np.isfinite(value)):
+                    return "--"
+                return f"{value[0]:.0f},{value[1]:.0f}"
+
+            cv2.putText(
+                preview,
+                f"TARGET W=({point_text('color_image1')}) "
+                f"F=({point_text('color_image2')})",
+                (8, 62),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    if marker_xy is not None:
+        cv2.drawMarker(
+            preview,
+            marker_xy,
+            (255, 0, 255),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=18,
+            thickness=2,
+            line_type=cv2.LINE_AA,
+        )
+        cv2.circle(preview, marker_xy, 8, (255, 255, 255), 2, cv2.LINE_AA)
     return preview
 
 
@@ -1110,6 +1680,7 @@ def _build_camera_preview(
     draw_part_poses,
     task_name="one_leg",
     annotation_observation=None,
+    annotation_status=None,
     prompt_depth_result=None,
     depth_min_m=0.05,
     depth_max_m=3.0,
@@ -1129,6 +1700,13 @@ def _build_camera_preview(
             camera_info["front"]["record_intrinsics"],
             part_names=TASK_PART_NAMES[task_name],
         )
+    wrist = _draw_real_skill_annotation(
+        wrist,
+        annotation_observation,
+        image_key="color_image1",
+        status=annotation_status,
+        show_text=True,
+    )
     front = _draw_real_skill_annotation(front, annotation_observation)
 
     valid = np.asarray(
@@ -1291,12 +1869,52 @@ def _write_episode(output_path, payload, video_fps, save_video):
     with temporary_path.open("wb") as output_file:
         pickle.dump(payload, output_file, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temporary_path, output_path)
-    if save_video:
-        _write_video_atomic(
-            output_path.with_suffix(".mp4"),
-            payload["observations"],
-            video_fps,
+    quality = payload.get("save_quality", {})
+    report_lines = [
+        f"pickle: {output_path.name}",
+        f"status: {quality.get('status', 'unknown')}",
+        f"observations: {len(payload.get('observations', []))}",
+        f"actions: {len(payload.get('actions', []))}",
+        f"raw_camera_samples: {len(payload.get('raw_camera_samples', []))}",
+        f"raw_arm_commands: {len(payload.get('raw_arm_commands_absolute', []))}",
+        f"raw_gripper_commands: {len(payload.get('raw_gripper_commands', []))}",
+        f"camera_sequence_gaps: {payload.get('metadata', {}).get('camera_sequence_gap_count', 0)}",
+        "",
+        "issues:",
+    ]
+    for issue in quality.get("issues", []):
+        report_lines.append(
+            f"- [{issue['time']}] {issue['phase']}: {issue['message']}"
         )
+        if issue.get("traceback"):
+            report_lines.append(issue["traceback"].rstrip())
+    if not quality.get("issues"):
+        report_lines.append("- none")
+    report_lines.extend(
+        [
+            "",
+            "alignment_report:",
+            json.dumps(payload.get("alignment_report"), indent=2, default=str),
+        ]
+    )
+    report_path = output_path.with_suffix(".txt")
+    temporary_report_path = report_path.with_suffix(".txt.tmp")
+    temporary_report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    os.replace(temporary_report_path, report_path)
+    if save_video:
+        try:
+            _write_video_atomic(
+                output_path.with_suffix(".mp4"),
+                payload["observations"],
+                video_fps,
+            )
+        except Exception as exc:
+            with report_path.open("a", encoding="utf-8") as report_file:
+                report_file.write(
+                    f"\nvideo_write_error: {type(exc).__name__}: {exc}\n"
+                    + traceback.format_exc()
+                )
+            logger.exception("Episode video failed; pickle and quality log were saved")
     return output_path
 
 
@@ -1310,6 +1928,884 @@ def _raw_episode_counts(outcomes_root):
         )
         for outcome in ("success", "failure")
     )
+
+
+class AsyncObservationPreview:
+    """Build live observations and render the dashboard off the control thread."""
+
+    def __init__(
+        self,
+        *,
+        camera,
+        robot_interface,
+        camera_info,
+        eepose_frame,
+        task_name,
+        draw_part_poses,
+        annotation_session_factory,
+        enable_annotation,
+        show_window,
+        depth_min_m,
+        depth_max_m,
+        depth_colormap,
+        refresh_hz=30.0,
+    ):
+        self.camera = camera
+        self.robot_interface = robot_interface
+        self.camera_info = camera_info
+        self.eepose_frame = eepose_frame
+        self.task_name = task_name
+        self.draw_part_poses = bool(draw_part_poses)
+        self.annotation_session_factory = annotation_session_factory
+        self.enable_annotation = bool(enable_annotation)
+        self.show_window = bool(show_window)
+        self.depth_min_m = float(depth_min_m)
+        self.depth_max_m = float(depth_max_m)
+        self.depth_colormap = depth_colormap
+        self.refresh_period_s = 1.0 / float(refresh_hz)
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="observation_preview",
+        )
+        self.future = None
+        self.next_submit_monotonic = 0.0
+        self.latest_observation = None
+        self.window_keys = []
+        self.annotation_session = None
+        self.annotation_capture_ns = None
+        self.last_annotation_observation = None
+        self.annotation_error = None
+        self.annotation_generation = 0
+        self.last_worker_error = None
+
+    @staticmethod
+    def _run_once(
+        camera,
+        robot_interface,
+        camera_info,
+        eepose_frame,
+        task_name,
+        draw_part_poses,
+        preview_state,
+        annotation_session_factory,
+        enable_annotation,
+        annotation_session,
+        annotation_capture_ns,
+        last_annotation_observation,
+        annotation_error,
+        annotation_generation,
+        show_window,
+        depth_min_m,
+        depth_max_m,
+        depth_colormap,
+    ):
+        camera_sample = camera.latest()
+        observation = build_observation(
+            robot_interface,
+            camera_sample,
+            eepose_frame,
+        )
+        if enable_annotation and observation is not None:
+            capture_ns = observation.get("camera_capture_wall_time_ns")
+            if capture_ns is None or capture_ns != annotation_capture_ns:
+                try:
+                    if annotation_session is None:
+                        annotation_session = annotation_session_factory(
+                            task_name, camera_info
+                        )
+                    annotation_session.annotate_observation(observation)
+                    last_annotation_observation = observation
+                    annotation_capture_ns = capture_ns
+                    annotation_error = None
+                except Exception as exc:
+                    annotation_error = f"{type(exc).__name__}: {exc}"
+                    annotation_session = None
+                    last_annotation_observation = None
+
+        window_key = None
+        if show_window:
+            annotation_status = None
+            if not enable_annotation:
+                annotation_status = "OFF: ADD --real-skill-annotation"
+            elif annotation_error:
+                annotation_status = f"ERROR {annotation_error[:36]}"
+                last_annotation_observation = None
+            elif last_annotation_observation is None:
+                annotation_status = "WAITING FOR POSES"
+            preview = _build_camera_preview(
+                camera_sample,
+                camera_info,
+                preview_state,
+                draw_part_poses,
+                task_name=task_name,
+                annotation_observation=last_annotation_observation,
+                annotation_status=annotation_status,
+                prompt_depth_result=None,
+                depth_min_m=depth_min_m,
+                depth_max_m=depth_max_m,
+                depth_colormap=depth_colormap,
+            )
+            if preview is not None:
+                cv2.imshow(PREVIEW_WINDOW_NAME, preview)
+                key_code = cv2.waitKey(1) & 0xFF
+                if key_code in map(ord, "besfdrpq"):
+                    window_key = chr(key_code)
+        return {
+            "observation": observation,
+            "window_key": window_key,
+            "annotation_session": annotation_session,
+            "annotation_capture_ns": annotation_capture_ns,
+            "last_annotation_observation": last_annotation_observation,
+            "annotation_error": annotation_error,
+            "annotation_generation": annotation_generation,
+        }
+
+    def request_annotation_reset(self):
+        self.annotation_generation += 1
+        self.annotation_session = None
+        self.annotation_capture_ns = None
+        self.last_annotation_observation = None
+        self.annotation_error = None
+
+    def pump(self, preview_state):
+        """Poll without waiting and enqueue at most one background refresh."""
+
+        if self.future is not None and self.future.done():
+            try:
+                result = self.future.result()
+                self.latest_observation = result["observation"]
+                if result["window_key"] is not None:
+                    self.window_keys.append(result["window_key"])
+                if result["annotation_generation"] == self.annotation_generation:
+                    previous_error = self.annotation_error
+                    self.annotation_session = result["annotation_session"]
+                    self.annotation_capture_ns = result["annotation_capture_ns"]
+                    self.last_annotation_observation = result[
+                        "last_annotation_observation"
+                    ]
+                    self.annotation_error = result["annotation_error"]
+                    if self.annotation_error and self.annotation_error != previous_error:
+                        logger.warning(
+                            "Live annotation is waiting for usable poses: %s",
+                            self.annotation_error,
+                        )
+                self.last_worker_error = None
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                if message != self.last_worker_error:
+                    logger.warning("Async observation preview failed: %s", message)
+                    self.last_worker_error = message
+            finally:
+                self.future = None
+
+        now = time.monotonic()
+        if self.future is None and now >= self.next_submit_monotonic:
+            generation = self.annotation_generation
+            self.future = self.executor.submit(
+                self._run_once,
+                self.camera,
+                self.robot_interface,
+                self.camera_info,
+                self.eepose_frame,
+                self.task_name,
+                self.draw_part_poses,
+                preview_state,
+                self.annotation_session_factory,
+                self.enable_annotation,
+                self.annotation_session,
+                self.annotation_capture_ns,
+                self.last_annotation_observation,
+                self.annotation_error,
+                generation,
+                self.show_window,
+                self.depth_min_m,
+                self.depth_max_m,
+                self.depth_colormap,
+            )
+            self.next_submit_monotonic = now + self.refresh_period_s
+
+    def read_window_keys(self):
+        keys = self.window_keys
+        self.window_keys = []
+        return keys
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+
+
+class AsyncCameraBufferCollector:
+    """Copy raw camera history into an episode without touching the control loop."""
+
+    def __init__(self, *, camera, episode, history_cursor, poll_s=0.01):
+        self.camera = camera
+        self.episode = episode
+        self.history_cursor = history_cursor
+        self.poll_s = float(poll_s)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="camera_episode_buffer",
+            daemon=True,
+        )
+        self.started = False
+
+    def start(self):
+        if not self.started:
+            self.started = True
+            self.thread.start()
+        return self
+
+    def _drain_once(self):
+        samples, self.history_cursor = self.camera.samples_since(
+            self.history_cursor
+        )
+        self.episode.add_camera_samples(samples)
+
+    def _run(self):
+        while not self.stop_event.wait(self.poll_s):
+            try:
+                self._drain_once()
+            except Exception as exc:
+                self.episode.mark_buffer_error(
+                    f"camera history drain failed: {type(exc).__name__}: {exc}"
+                )
+                return
+
+    def stop(self):
+        if not self.started:
+            return
+        self.stop_event.set()
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            self.episode.mark_buffer_error(
+                "camera history collector did not stop within 2 seconds"
+            )
+            return
+        try:
+            self._drain_once()
+        except Exception as exc:
+            self.episode.mark_buffer_error(
+                f"final camera history drain failed: {type(exc).__name__}: {exc}"
+            )
+
+
+class _StrictGridActionDispatcherV6:
+    """Dispatch arm and gripper commands on independent single-thread lanes."""
+
+    def __init__(
+        self,
+        *,
+        robot_interface,
+        controller_type,
+        controller_cfg,
+        schedule,
+        action_period_ns,
+    ):
+        self.robot_interface = robot_interface
+        self.controller_type = controller_type
+        self.controller_cfg = controller_cfg
+        self.schedule = schedule
+        self.action_period_ns = int(action_period_ns)
+        self.cancel_event = threading.Event()
+        self.executors = {
+            "robot": concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="robot_action"
+            ),
+            "gripper": concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="gripper_action"
+            ),
+        }
+        self.pending = []
+        self.closed = False
+
+    def _wait_for_deadline(self, deadline_monotonic):
+        delay_s = float(deadline_monotonic) - time.monotonic()
+        if delay_s > 0 and self.cancel_event.wait(delay_s):
+            return False
+        return not self.cancel_event.is_set()
+
+    def _dispatch_channel(self, channel, command, channel_action):
+        if not self._wait_for_deadline(command[f"{channel}_deadline_monotonic"]):
+            return {"channel": channel, "status": "cancelled"}
+
+        target_wall_time_ns = int(command["target_wall_time_ns"])
+        started_wall_time_ns = time.time_ns()
+        if self.schedule.dispatch_expired(
+            target_wall_time_ns, started_wall_time_ns, channel
+        ):
+            return {
+                "channel": channel,
+                "status": "dropped",
+                "drop_reason": f"stale_{channel}_deadline",
+                "started_wall_time_ns": started_wall_time_ns,
+            }
+
+        started_monotonic = time.monotonic()
+        try:
+            if channel == "robot":
+                result = self.robot_interface.control(
+                    controller_type=self.controller_type,
+                    action=np.asarray(channel_action, dtype=np.float64).copy(),
+                    controller_cfg=self.controller_cfg,
+                    control_gripper=False,
+                    enforce_control_frequency=False,
+                )
+                send_wall_time_ns = result["robot_command_wall_time_ns"]
+            else:
+                self.robot_interface.gripper_control(
+                    float(channel_action[-1])
+                )
+                send_wall_time_ns = (
+                    self.robot_interface.last_gripper_command_wall_time_ns
+                )
+        except Exception as exc:
+            return {
+                "channel": channel,
+                "status": "error",
+                "drop_reason": f"{channel}_send_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "started_wall_time_ns": started_wall_time_ns,
+                "elapsed_ms": (time.monotonic() - started_monotonic) * 1e3,
+            }
+
+        elapsed_ms = (time.monotonic() - started_monotonic) * 1e3
+        deadline_wall_time_ns = self.schedule.deadline_ns(
+            target_wall_time_ns, channel
+        )
+        completion_lateness_ns = int(send_wall_time_ns) - deadline_wall_time_ns
+        status = (
+            "late_send"
+            if completion_lateness_ns
+            > self.schedule.dispatch_tolerance_ns
+            else "executed"
+        )
+        return {
+            "channel": channel,
+            "status": status,
+            "drop_reason": (
+                f"late_{channel}_send_completion"
+                if status == "late_send"
+                else None
+            ),
+            "started_wall_time_ns": started_wall_time_ns,
+            "send_wall_time_ns": int(send_wall_time_ns),
+            "elapsed_ms": elapsed_ms,
+            "deadline_lateness_ms": completion_lateness_ns / 1e6,
+            "send_residual_ms": (
+                int(send_wall_time_ns) - target_wall_time_ns
+            )
+            / 1e6,
+        }
+
+    def submit_channel(self, command, channel, sampled_action):
+        if self.closed:
+            raise RuntimeError("action dispatcher is closed")
+        if channel not in ("robot", "gripper"):
+            raise ValueError(f"unsupported action channel {channel!r}")
+        target_wall_time_ns = int(command["target_wall_time_ns"])
+        record = next(
+            (
+                pending
+                for pending in self.pending
+                if int(pending["target_wall_time_ns"]) == target_wall_time_ns
+            ),
+            None,
+        )
+        if record is None:
+            record = dict(command)
+            record["futures"] = {}
+            record["channel_actions"] = {}
+            self.pending.append(record)
+            self.pending.sort(key=lambda item: int(item["target_wall_time_ns"]))
+        if channel in record["futures"]:
+            raise RuntimeError(
+                f"duplicate {channel} action for target {target_wall_time_ns}"
+            )
+        channel_action = np.asarray(sampled_action, dtype=np.float64).copy()
+        record["channel_actions"][channel] = channel_action
+        sample_wall_time_ns = int(command[f"{channel}_sample_wall_time_ns"])
+        record["timing"][f"{channel}_sample_wall_time_ns"] = sample_wall_time_ns
+        record["timing"][f"{channel}_sample_lead_ms"] = (
+            target_wall_time_ns - sample_wall_time_ns
+        ) / 1e6
+        record["futures"][channel] = self.executors[channel].submit(
+            self._dispatch_channel, channel, record, channel_action
+        )
+
+    def _finalize_record(self, record, episode, cancel_reason=None):
+        timing = dict(record["timing"])
+        results = {
+            channel: record["futures"][channel].result()
+            for channel in ("robot", "gripper")
+        }
+        failed = []
+        for channel, result in results.items():
+            timing[f"{channel}_dispatch_status"] = result["status"]
+            if result.get("started_wall_time_ns") is not None:
+                timing[f"{channel}_command_start_wall_time_ns"] = result[
+                    "started_wall_time_ns"
+                ]
+            if result.get("send_wall_time_ns") is not None:
+                timing[f"{channel}_command_wall_time_ns"] = result[
+                    "send_wall_time_ns"
+                ]
+                timing[f"{channel}_send_residual_ms"] = result[
+                    "send_residual_ms"
+                ]
+            if result.get("elapsed_ms") is not None:
+                timing[f"{channel}_control_elapsed_ms"] = result["elapsed_ms"]
+                timing[f"{channel}_deadline_lateness_ms"] = result.get(
+                    "deadline_lateness_ms"
+                )
+                if result["elapsed_ms"] > 5.0:
+                    logger.warning(
+                        "Timing probe slow async send grid=%s channel=%s "
+                        "elapsed_ms=%.3f target_residual_ms=%s",
+                        timing.get("grid_index"),
+                        channel,
+                        result["elapsed_ms"],
+                        result.get("send_residual_ms"),
+                    )
+            if result["status"] != "executed":
+                failed.append(result)
+
+        if failed:
+            reason = cancel_reason or failed[0].get(
+                "drop_reason", failed[0]["status"]
+            )
+            timing.update(
+                status=(
+                    "cancelled"
+                    if all(result["status"] == "cancelled" for result in failed)
+                    else "partial_dispatch_failure"
+                ),
+                drop_reason=reason,
+                dropped_wall_time_ns=time.time_ns(),
+            )
+            errors = [result.get("error") for result in failed if result.get("error")]
+            if errors:
+                timing["dispatch_errors"] = errors
+            episode.record_dropped_command(
+                timing,
+                invalidate_continuity=cancel_reason is None,
+            )
+            return
+
+        combined_action = np.zeros(7, dtype=np.float64)
+        combined_action[:6] = record["channel_actions"]["robot"][:6]
+        combined_action[-1] = record["channel_actions"]["gripper"][-1]
+        timing["status"] = "executed"
+        episode.append_buffered(
+            scaled_deoxys_action(combined_action, self.controller_cfg),
+            action_timing=timing,
+        )
+
+    def pump(self, episode):
+        """Finalize completed commands in grid order without blocking."""
+
+        completed = 0
+        while (
+            self.pending
+            and set(self.pending[0]["futures"]) == {"robot", "gripper"}
+            and all(
+                future.done() for future in self.pending[0]["futures"].values()
+            )
+        ):
+            record = self.pending.pop(0)
+            self._finalize_record(record, episode)
+            completed += 1
+        return completed
+
+    def flush_and_close(self, episode, timeout_s=2.0):
+        deadline = time.monotonic() + float(timeout_s)
+        while (
+            any(
+                set(record["futures"]) == {"robot", "gripper"}
+                for record in self.pending
+            )
+            and time.monotonic() < deadline
+        ):
+            self.pump(episode)
+            if self.pending:
+                time.sleep(0.001)
+        complete_pending = [
+            record
+            for record in self.pending
+            if set(record["futures"]) == {"robot", "gripper"}
+        ]
+        if complete_pending:
+            self.cancel_event.set()
+            concurrent.futures.wait(
+                [
+                    future
+                    for record in complete_pending
+                    for future in record["futures"].values()
+                ],
+                timeout=2.0,
+            )
+            while (
+                self.pending
+                and set(self.pending[0]["futures"]) == {"robot", "gripper"}
+                and all(
+                    future.done() for future in self.pending[0]["futures"].values()
+                )
+            ):
+                record = self.pending.pop(0)
+                self._finalize_record(
+                    record, episode, cancel_reason="action_dispatch_flush_timeout"
+                )
+        for record in self.pending:
+            timing = dict(record["timing"])
+            timing.update(
+                status="tail_incomplete",
+                drop_reason="operator_stopped_before_all_channel_samples",
+                dropped_wall_time_ns=time.time_ns(),
+            )
+            episode.record_dropped_command(timing, invalidate_continuity=False)
+        self.pending = []
+        self.close()
+
+    def cancel_and_close(self, episode, reason):
+        self.cancel_event.set()
+        concurrent.futures.wait(
+            [
+                future
+                for record in self.pending
+                for future in record["futures"].values()
+            ],
+            timeout=2.0,
+        )
+        for record in self.pending:
+            if all(future.done() for future in record["futures"].values()):
+                if set(record["futures"]) == {"robot", "gripper"}:
+                    self._finalize_record(record, episode, cancel_reason=reason)
+                else:
+                    timing = dict(record["timing"])
+                    timing.update(
+                        status="cancelled",
+                        drop_reason=reason,
+                        dropped_wall_time_ns=time.time_ns(),
+                    )
+                    episode.record_dropped_command(
+                        timing, invalidate_continuity=False
+                    )
+        self.pending = []
+        self.close()
+
+    @property
+    def pending_count(self):
+        return len(self.pending)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for executor in self.executors.values():
+            executor.shutdown(wait=True)
+
+
+class AsyncActionDispatcher:
+    """Independent latest-wins lanes for absolute arm and gripper targets."""
+
+    def __init__(
+        self,
+        *,
+        robot_interface,
+        controller_type,
+        controller_cfg,
+        arm_latency_ns,
+        gripper_latency_ns,
+    ):
+        self.robot_interface = robot_interface
+        self.controller_type = controller_type
+        self.controller_cfg = controller_cfg
+        self.latencies = {
+            "robot": int(arm_latency_ns),
+            "gripper": int(gripper_latency_ns),
+        }
+        self.executors = {
+            channel: concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"{channel}_latest_action"
+            )
+            for channel in ("robot", "gripper")
+        }
+        self.lock = threading.RLock()
+        self.active = {"robot": None, "gripper": None}
+        self.queued = {"robot": None, "gripper": None}
+        self.completed = []
+        self.accepting = True
+        self.closed = False
+        self.overwritten = {"robot": 0, "gripper": 0}
+
+    def _send(self, channel, command):
+        record = dict(command)
+        record["channel"] = channel
+        record["command_start_wall_time_ns"] = time.time_ns()
+        started_monotonic = time.monotonic()
+        try:
+            if channel == "robot":
+                result = self.robot_interface.control(
+                    controller_type=self.controller_type,
+                    action=np.asarray(
+                        command["absolute_wrist_action"], dtype=np.float64
+                    ).copy(),
+                    controller_cfg=self.controller_cfg,
+                    control_gripper=False,
+                )
+                command_wall_time_ns = int(result["robot_command_wall_time_ns"])
+            else:
+                self.robot_interface.gripper_control(
+                    float(command["gripper_action"])
+                )
+                command_wall_time_ns = int(
+                    self.robot_interface.last_gripper_command_wall_time_ns
+                )
+        except Exception as exc:
+            record.update(
+                status="send_error",
+                error=f"{type(exc).__name__}: {exc}",
+                control_elapsed_ms=(time.monotonic() - started_monotonic) * 1e3,
+            )
+            return record
+        record.update(
+            status="executed",
+            command_wall_time_ns=command_wall_time_ns,
+            predicted_effect_wall_time_ns=(
+                command_wall_time_ns + self.latencies[channel]
+            ),
+            control_elapsed_ms=(time.monotonic() - started_monotonic) * 1e3,
+        )
+        return record
+
+    def _start_locked(self, channel, command):
+        future = self.executors[channel].submit(self._send, channel, command)
+        self.active[channel] = future
+        future.add_done_callback(
+            lambda completed, lane=channel: self._on_done(lane, completed)
+        )
+
+    def _on_done(self, channel, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {
+                "channel": channel,
+                "status": "worker_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        with self.lock:
+            self.completed.append(result)
+            self.active[channel] = None
+            queued = self.queued[channel]
+            self.queued[channel] = None
+            if queued is not None:
+                self._start_locked(channel, queued)
+
+    def _submit(self, channel, command):
+        with self.lock:
+            if not self.accepting:
+                return False
+            if self.active[channel] is None:
+                self._start_locked(channel, dict(command))
+            else:
+                previous = self.queued[channel]
+                if previous is not None:
+                    self.overwritten[channel] += 1
+                    dropped = dict(previous)
+                    dropped.update(
+                        channel=channel,
+                        status="overwritten_before_send",
+                        overwritten_wall_time_ns=time.time_ns(),
+                    )
+                    self.completed.append(dropped)
+                self.queued[channel] = dict(command)
+        return True
+
+    def submit_arm(self, absolute_wrist_action, *, sample_wall_time_ns, sample_index):
+        return self._submit(
+            "robot",
+            {
+                "absolute_wrist_action": np.asarray(
+                    absolute_wrist_action, dtype=np.float64
+                ).copy(),
+                "sample_wall_time_ns": int(sample_wall_time_ns),
+                "sample_index": int(sample_index),
+            },
+        )
+
+    def submit_gripper(self, gripper_action, *, sample_wall_time_ns, sample_index):
+        return self._submit(
+            "gripper",
+            {
+                "gripper_action": float(np.sign(gripper_action)),
+                "sample_wall_time_ns": int(sample_wall_time_ns),
+                "sample_index": int(sample_index),
+            },
+        )
+
+    def drain(self, episode):
+        with self.lock:
+            completed = self.completed
+            self.completed = []
+        for record in completed:
+            episode.record_raw_dispatch(record)
+        return len(completed)
+
+    @property
+    def pending_count(self):
+        with self.lock:
+            return sum(
+                self.active[channel] is not None
+                or self.queued[channel] is not None
+                for channel in ("robot", "gripper")
+            )
+
+    def close(self, episode, *, flush=True, timeout_s=3.0):
+        if self.closed:
+            return
+        with self.lock:
+            self.accepting = False
+            if not flush:
+                for channel in ("robot", "gripper"):
+                    queued = self.queued[channel]
+                    self.queued[channel] = None
+                    if queued is not None:
+                        queued = dict(queued)
+                        queued.update(channel=channel, status="cancelled_before_send")
+                        self.completed.append(queued)
+        deadline = time.monotonic() + float(timeout_s)
+        while self.pending_count and time.monotonic() < deadline:
+            self.drain(episode)
+            time.sleep(0.001)
+        with self.lock:
+            for channel in ("robot", "gripper"):
+                queued = self.queued[channel]
+                self.queued[channel] = None
+                if queued is not None:
+                    queued = dict(queued)
+                    queued.update(channel=channel, status="flush_timeout")
+                    self.completed.append(queued)
+        for executor in self.executors.values():
+            executor.shutdown(wait=True)
+        self.drain(episode)
+        self.closed = True
+
+
+class AbsoluteSpaceMouseSampler:
+    """Sample SpaceMouse at high rate and integrate a base-frame wrist target."""
+
+    def __init__(
+        self,
+        *,
+        device,
+        dispatcher,
+        episode,
+        initial_wrist_pose,
+        delta_controller_cfg,
+        sample_hz=30.0,
+        motion_reference_hz=10.0,
+        gripper_keepalive_s=1.0,
+    ):
+        self.device = device
+        self.dispatcher = dispatcher
+        self.episode = episode
+        self.delta_controller_cfg = delta_controller_cfg
+        self.sample_hz = float(sample_hz)
+        self.motion_scale = float(motion_reference_hz) / self.sample_hz
+        self.gripper_keepalive_s = float(gripper_keepalive_s)
+        self.target_pose = np.asarray(initial_wrist_pose, dtype=np.float64).copy()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="spacemouse_absolute_sampler",
+            daemon=True,
+        )
+        self.sample_index = 0
+        self.last_gripper_action = None
+        self.last_gripper_submit_monotonic = float("-inf")
+        self.operator_stopped = False
+        self.error = None
+        self.missed_ticks = 0
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _run(self):
+        period_s = 1.0 / self.sample_hz
+        next_tick = time.monotonic()
+        try:
+            while not self.stop_event.is_set():
+                remaining_s = next_tick - time.monotonic()
+                if remaining_s > 0 and self.stop_event.wait(remaining_s):
+                    break
+                action, _ = input2action(
+                    device=self.device,
+                    controller_type="OSC_POSE",
+                )
+                if action is None:
+                    self.operator_stopped = True
+                    break
+                sample_wall_time_ns = time.time_ns()
+                self.target_pose, physical_delta = integrate_absolute_wrist_target(
+                    self.target_pose,
+                    action,
+                    self.delta_controller_cfg,
+                    self.motion_scale,
+                )
+                gripper_action = float(np.sign(action[-1]))
+                absolute_action = np.concatenate(
+                    [
+                        self.target_pose[:3, 3],
+                        Rotation.from_matrix(self.target_pose[:3, :3]).as_rotvec(),
+                        [gripper_action],
+                    ]
+                )
+                self.episode.record_raw_spacemouse_sample(
+                    {
+                        "sample_index": self.sample_index,
+                        "sample_wall_time_ns": sample_wall_time_ns,
+                        "raw_deoxys_delta_action": np.asarray(
+                            action, dtype=np.float64
+                        ).copy(),
+                        "scaled_physical_delta": physical_delta.copy(),
+                        "absolute_wrist_action": absolute_action.copy(),
+                    }
+                )
+                self.dispatcher.submit_arm(
+                    absolute_action,
+                    sample_wall_time_ns=sample_wall_time_ns,
+                    sample_index=self.sample_index,
+                )
+                now = time.monotonic()
+                if (
+                    self.last_gripper_action is None
+                    or gripper_action != self.last_gripper_action
+                    or now - self.last_gripper_submit_monotonic
+                    >= self.gripper_keepalive_s
+                ):
+                    self.dispatcher.submit_gripper(
+                        gripper_action,
+                        sample_wall_time_ns=sample_wall_time_ns,
+                        sample_index=self.sample_index,
+                    )
+                    self.last_gripper_action = gripper_action
+                    self.last_gripper_submit_monotonic = now
+                self.sample_index += 1
+                next_tick += period_s
+                now = time.monotonic()
+                if now > next_tick + period_s:
+                    missed = int((now - next_tick) / period_s)
+                    self.missed_ticks += missed
+                    next_tick += missed * period_s
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            raise RuntimeError("SpaceMouse sampler did not stop within 2 seconds")
 
 
 class EpisodeWriter:
@@ -1367,12 +2863,14 @@ class RawEpisodeRecorder:
         annotation_session_factory=None,
         eepose_frame="robot-base",
         record_fps=10.0,
+        teleop_fps=30.0,
         robot_action_latency_ms=10.0,
         gripper_action_latency_ms=10.0,
         action_stale_guard_ms=10.0,
         max_command_lateness_ms=10.0,
         robot_observation_latency_ms=0.0,
         gripper_observation_latency_ms=0.0,
+        latency_profile=None,
         output_suffix=None,
         annotation_source="scripted",
     ):
@@ -1394,6 +2892,9 @@ class RawEpisodeRecorder:
         self.record_fps = float(record_fps)
         if self.record_fps <= 0:
             raise ValueError("record_fps must be positive")
+        self.teleop_fps = float(teleop_fps)
+        if self.teleop_fps <= 0:
+            raise ValueError("teleop_fps must be positive")
         self.machine_time_schedule = MachineTimeSchedule.from_milliseconds(
             robot_action_ms=robot_action_latency_ms,
             gripper_action_ms=gripper_action_latency_ms,
@@ -1408,6 +2909,7 @@ class RawEpisodeRecorder:
                 raise ValueError(f"{name} must be finite and non-negative")
         self.robot_observation_latency_ms = float(robot_observation_latency_ms)
         self.gripper_observation_latency_ms = float(gripper_observation_latency_ms)
+        self.latency_profile = dict(latency_profile or {})
         self.annotation_session = None
         self.annotation_error = None
         self.observations = []
@@ -1428,8 +2930,17 @@ class RawEpisodeRecorder:
         self.robot_start_index = None
         self.gripper_start_index = None
         self.buffer_error = None
+        self.quality_issues = []
+        self.raw_failed_streams = None
         self.buffer_alignment_report = None
         self.prompt_depth_report = None
+        self.raw_lock = threading.Lock()
+        self.raw_arm_commands_absolute = []
+        self.raw_gripper_commands = []
+        self.raw_spacemouse_samples = []
+        self.grid_start_wall_time_ns = None
+        self.grid_end_wall_time_ns = None
+        self.camera_sequence_gap_count = 0
 
     def _parts_ready(self, observation):
         if observation is None:
@@ -1486,8 +2997,16 @@ class RawEpisodeRecorder:
         self.buffered_actions = []
         self.camera_samples = []
         self.buffer_error = None
+        self.quality_issues = []
+        self.raw_failed_streams = None
         self.buffer_alignment_report = None
         self.prompt_depth_report = None
+        self.raw_arm_commands_absolute = []
+        self.raw_gripper_commands = []
+        self.raw_spacemouse_samples = []
+        self.grid_start_wall_time_ns = None
+        self.grid_end_wall_time_ns = None
+        self.camera_sequence_gap_count = 0
         self.state = "recording"
         logger.info("Recording started")
         return True
@@ -1499,6 +3018,9 @@ class RawEpisodeRecorder:
         camera_start_sequence,
         robot_start_index,
         gripper_start_index,
+        grid_start_wall_time_ns,
+        initial_absolute_wrist_action,
+        initial_gripper_action,
     ):
         """Start a raw-buffer episode without online depth/annotation work."""
 
@@ -1508,13 +3030,7 @@ class RawEpisodeRecorder:
         if self.state == "pending_save":
             logger.warning("Save or discard the previous episode first")
             return False
-        if not self._parts_ready(initial_observation):
-            required_parts = ", ".join(TASK_PART_NAMES[self.task_name].values())
-            logger.warning(
-                "Recording not started: required %s poses have not all been detected",
-                required_parts,
-            )
-            return False
+        initial_poses_valid = self._parts_ready(initial_observation)
         self.observations = []
         self.actions = []
         self.actions_original = []
@@ -1527,8 +3043,39 @@ class RawEpisodeRecorder:
         self.robot_start_index = max(0, int(robot_start_index) - 2)
         self.gripper_start_index = max(0, int(gripper_start_index) - 2)
         self.buffer_error = None
+        self.quality_issues = []
+        self.raw_failed_streams = None
         self.buffer_alignment_report = None
         self.prompt_depth_report = None
+        self.raw_arm_commands_absolute = []
+        self.raw_gripper_commands = []
+        self.raw_spacemouse_samples = []
+        self.grid_start_wall_time_ns = int(grid_start_wall_time_ns)
+        self.grid_end_wall_time_ns = None
+        self.camera_sequence_gap_count = 0
+        initial_absolute_wrist_action = np.asarray(
+            initial_absolute_wrist_action, dtype=np.float64
+        ).copy()
+        self.raw_arm_commands_absolute.append(
+            {
+                "channel": "robot",
+                "status": "initial_state",
+                "absolute_wrist_action": initial_absolute_wrist_action,
+                "sample_wall_time_ns": self.grid_start_wall_time_ns,
+                "command_wall_time_ns": None,
+                "predicted_effect_wall_time_ns": self.grid_start_wall_time_ns,
+            }
+        )
+        self.raw_gripper_commands.append(
+            {
+                "channel": "gripper",
+                "status": "initial_state",
+                "gripper_action": float(np.sign(initial_gripper_action)),
+                "sample_wall_time_ns": self.grid_start_wall_time_ns,
+                "command_wall_time_ns": None,
+                "predicted_effect_wall_time_ns": self.grid_start_wall_time_ns,
+            }
+        )
         self.started_at = datetime.now().isoformat(timespec="milliseconds")
         self.stopped_at = None
         self.last_recorded_gripper = None
@@ -1537,6 +3084,11 @@ class RawEpisodeRecorder:
         self.annotation_error = None
         self.buffered_mode = True
         self.state = "recording"
+        if not initial_poses_valid:
+            self.mark_buffer_error(
+                "required part poses are not all valid at recording start",
+                phase="geometry",
+            )
         logger.info(
             "Buffered recording started at camera sequence %d; PromptDA and "
             "annotation are deferred until end",
@@ -1557,10 +3109,33 @@ class RawEpisodeRecorder:
                     )
                     continue
                 if sequence != previous + 1:
-                    self.mark_buffer_error(
-                        f"camera capture buffer lost sequences {previous + 1}..{sequence - 1}"
+                    self.camera_sequence_gap_count += sequence - previous - 1
+                    logger.warning(
+                        "Camera capture buffer skipped sequences %d..%d; "
+                        "offline alignment may reuse a nearby frame",
+                        previous + 1,
+                        sequence - 1,
                     )
             self.camera_samples.append(_copy_mapping_arrays(sample))
+
+    def record_raw_spacemouse_sample(self, record):
+        if self.state != "recording" or not self.buffered_mode:
+            return
+        with self.raw_lock:
+            self.raw_spacemouse_samples.append(_copy_mapping_arrays(record))
+
+    def record_raw_dispatch(self, record):
+        if self.state != "recording" or not self.buffered_mode:
+            return
+        copied = _copy_mapping_arrays(record)
+        with self.raw_lock:
+            self.command_attempts.append(dict(copied))
+            if copied.get("status") != "executed":
+                return
+            if copied.get("channel") == "robot":
+                self.raw_arm_commands_absolute.append(copied)
+            elif copied.get("channel") == "gripper":
+                self.raw_gripper_commands.append(copied)
 
     def append_buffered(self, scaled_action, *, action_timing):
         if self.state != "recording" or not self.buffered_mode:
@@ -1589,10 +3164,19 @@ class RawEpisodeRecorder:
         self.buffered_actions.append(record)
         self.command_attempts.append(dict(timing))
 
-    def mark_buffer_error(self, reason):
+    def mark_buffer_error(self, reason, *, phase="recording", traceback_text=None):
+        message = str(reason)
+        self.quality_issues.append(
+            {
+                "time": datetime.now().isoformat(timespec="milliseconds"),
+                "phase": phase,
+                "message": message,
+                "traceback": traceback_text,
+            }
+        )
         if self.buffer_error is None:
-            self.buffer_error = str(reason)
-            logger.error("Current buffered episode is invalid: %s", self.buffer_error)
+            self.buffer_error = message
+        logger.error("Buffered episode quality issue [%s]: %s", phase, message)
 
     def should_record(self, action, no_op_threshold, gripper_hold_frames):
         gripper = float(np.sign(action[-1]))
@@ -1689,6 +3273,7 @@ class RawEpisodeRecorder:
         prompt_depth_cameras,
         camera_max_residual_ms,
         camera_pair_max_skew_ms,
+        camera_hard_gap_ms,
         robot_max_residual_ms,
         gripper_max_residual_ms,
     ):
@@ -1696,19 +3281,30 @@ class RawEpisodeRecorder:
             logger.warning("No buffered episode is recording")
             return False
         self.stopped_at = datetime.now().isoformat(timespec="milliseconds")
+        if self.grid_end_wall_time_ns is None:
+            self.grid_end_wall_time_ns = time.time_ns()
         self.state = "pending_save"
-        if self.buffer_error is not None:
-            logger.error(
-                "Buffered episode stopped invalid and cannot be saved: %s",
-                self.buffer_error,
-            )
-            return False
+        robot_episode_records = robot_records[self.robot_start_index :]
+        gripper_episode_records = gripper_records[self.gripper_start_index :]
+        logger.info(
+            "Buffered alignment input: arm_commands=%d gripper_commands=%d "
+            "spacemouse_samples=%d camera_pairs=%d robot_states=%d gripper_states=%d",
+            len(self.raw_arm_commands_absolute),
+            len(self.raw_gripper_commands),
+            len(self.raw_spacemouse_samples),
+            len(self.camera_samples),
+            len(robot_episode_records),
+            len(gripper_episode_records),
+        )
         try:
             materialized = materialize_buffered_episode(
-                self.buffered_actions,
+                self.raw_arm_commands_absolute,
+                self.raw_gripper_commands,
                 self.camera_samples,
-                robot_records[self.robot_start_index :],
-                gripper_records[self.gripper_start_index :],
+                robot_episode_records,
+                gripper_episode_records,
+                grid_start_wall_time_ns=self.grid_start_wall_time_ns,
+                grid_end_wall_time_ns=self.grid_end_wall_time_ns,
                 camera_info=self.camera_info,
                 eepose_frame=self.eepose_frame,
                 action_period_ns=int(round(1e9 / self.record_fps)),
@@ -1716,6 +3312,7 @@ class RawEpisodeRecorder:
                 camera_pair_max_skew_ns=int(
                     round(camera_pair_max_skew_ms * 1e6)
                 ),
+                camera_hard_gap_ns=int(round(camera_hard_gap_ms * 1e6)),
                 robot_max_residual_ns=int(round(robot_max_residual_ms * 1e6)),
                 gripper_max_residual_ns=int(
                     round(gripper_max_residual_ms * 1e6)
@@ -1733,28 +3330,98 @@ class RawEpisodeRecorder:
             self.actions_absolute = materialized["actions_absolute"]
             self.action_timing = materialized["action_timing"]
             self.buffer_alignment_report = materialized["report"]
-            invalid_pose_frames = [
-                index
-                for index, observation in enumerate(self.observations)
-                if not self._parts_ready(observation)
-            ]
-            if invalid_pose_frames:
-                raise RuntimeError(
-                    "required geometry is invalid after alignment at frames "
-                    f"{invalid_pose_frames[:20]}"
+        except Exception as exc:
+            self.raw_failed_streams = {
+                "camera_samples": self.camera_samples,
+                "robot_states": _serializable_raw_state_records(
+                    robot_episode_records
+                ),
+                "gripper_states": _serializable_raw_state_records(
+                    gripper_episode_records
+                ),
+            }
+            self.mark_buffer_error(
+                f"{type(exc).__name__}: {exc}",
+                phase="offline_alignment",
+                traceback_text=traceback.format_exc(),
+            )
+            logger.exception(
+                "Buffered alignment failed; raw streams can still be saved"
+            )
+            return False
+
+        for steps_key, summary_key, limit_ms in (
+            ("camera_hard_gap_steps", "front_residual", camera_hard_gap_ms),
+            ("robot_state_warning_steps", "robot_residual", robot_max_residual_ms),
+            (
+                "gripper_state_warning_steps",
+                "gripper_state_residual",
+                gripper_max_residual_ms,
+            ),
+        ):
+            steps = self.buffer_alignment_report.get(steps_key, [])
+            if steps:
+                maximum_ms = self.buffer_alignment_report[summary_key]["max_ms"]
+                if steps_key == "camera_hard_gap_steps":
+                    maximum_ms = max(
+                        maximum_ms,
+                        self.buffer_alignment_report["wrist_residual"]["max_ms"],
+                    )
+                self.mark_buffer_error(
+                    f"{steps_key}: {len(steps)} steps exceed {limit_ms:.3f} ms "
+                    f"(first step={steps[0]}, max residual={maximum_ms:.3f} ms); "
+                    "aligned observations were retained",
+                    phase="offline_alignment",
                 )
+
+        invalid_pose_frames = [
+            index
+            for index, observation in enumerate(self.observations)
+            if not self._parts_ready(observation)
+        ]
+        if invalid_pose_frames:
+            self.mark_buffer_error(
+                "required geometry is invalid after alignment at frames "
+                f"{invalid_pose_frames}",
+                phase="geometry",
+            )
+        try:
             self.prompt_depth_report = apply_prompt_depth_offline(
                 self.observations,
                 prompt_depth_estimator,
                 prompt_depth_cameras,
             )
-            if self.annotation_session_factory is not None:
+            if (
+                prompt_depth_estimator is None
+                or set(prompt_depth_cameras) != {"front", "wrist"}
+            ):
+                self.mark_buffer_error(
+                    "offline PromptDA is not configured for both cameras",
+                    phase="prompt_depth",
+                )
+        except Exception as exc:
+            self.prompt_depth_report = {
+                "enabled": True,
+                "complete": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self.mark_buffer_error(
+                f"{type(exc).__name__}: {exc}",
+                phase="prompt_depth",
+                traceback_text=traceback.format_exc(),
+            )
+            logger.exception("Offline PromptDA failed; RGBD will still be saved")
+
+        if self.annotation_session_factory is not None:
+            annotation_frame_index = None
+            try:
                 self.annotation_session = self.annotation_session_factory(
                     self.task_name,
                     self.camera_info,
                     mode="offline",
                 )
                 for index, observation in enumerate(self.observations):
+                    annotation_frame_index = index
                     self.annotation_session.annotate_observation(observation)
                     if (index + 1) % 50 == 0 or index + 1 == len(self.observations):
                         logger.info(
@@ -1762,22 +3429,33 @@ class RawEpisodeRecorder:
                             index + 1,
                             len(self.observations),
                         )
-        except Exception as exc:
-            self.annotation_error = f"{type(exc).__name__}: {exc}"
-            self.annotation_session = None
-            for observation in self.observations:
-                _clear_real_skill_annotation(observation)
-            self.mark_buffer_error(self.annotation_error)
-            logger.exception(
-                "Buffered episode materialization failed; save is disabled"
+            except Exception as exc:
+                self.annotation_error = (
+                    f"frame {annotation_frame_index}: {type(exc).__name__}: {exc}"
+                )
+                self.annotation_session = None
+                for observation in self.observations:
+                    _clear_real_skill_annotation(observation)
+                self.mark_buffer_error(
+                    self.annotation_error,
+                    phase="offline_annotation",
+                    traceback_text=traceback.format_exc(),
+                )
+                logger.exception(
+                    "Offline annotation failed; observations will still be saved"
+                )
+        else:
+            self.mark_buffer_error(
+                "no offline annotation session; add --real-skill-annotation",
+                phase="offline_annotation",
             )
-            return False
         logger.info(
-            "Buffered recording materialized with %d continuous actions. "
-            "Press s=success, f=failure, d=discard",
+            "Buffered recording materialized with %d actions and %d quality "
+            "issues. Press s=success, f=failure, d=discard; issues do not block save",
             len(self.actions),
+            len(self.quality_issues),
         )
-        return True
+        return not self.quality_issues
 
     def _output_path(self, outcome):
         output_dir = (
@@ -1798,25 +3476,29 @@ class RawEpisodeRecorder:
         if self.state != "pending_save":
             logger.warning("There is no stopped episode waiting to be saved")
             return None
-        if self.buffer_error is not None:
-            logger.error(
-                "Refusing to save invalid buffered episode: %s. Press d to discard.",
-                self.buffer_error,
-            )
-            return None
         if not self.actions:
-            logger.warning("The episode contains no action; discarding it")
-            self.discard()
-            return None
+            if not self.buffered_mode:
+                logger.warning("The episode contains no action; discarding it")
+                self.discard()
+                return None
+            self.mark_buffer_error(
+                "no aligned actions; saving available raw streams only",
+                phase="save",
+            )
         valid_observation_lengths = (
             {len(self.actions)}
             if self.buffered_mode
             else {len(self.actions), len(self.actions) + 1}
         )
         if len(self.observations) not in valid_observation_lengths:
-            raise RuntimeError(
+            if not self.buffered_mode:
+                raise RuntimeError(
+                    "legacy episodes require N or N+1 observations for N actions"
+                )
+            self.mark_buffer_error(
                 "buffered episodes require N observations/N actions; legacy "
-                "episodes may contain N or N+1 observations"
+                "episodes may contain N or N+1 observations",
+                phase="save",
             )
 
         outcome = "success" if success else "failure"
@@ -1837,11 +3519,22 @@ class RawEpisodeRecorder:
                 for timing in self.action_timing
             ],
             "command_attempts": self.command_attempts,
+            "raw_arm_commands_absolute": self.raw_arm_commands_absolute,
+            "raw_gripper_commands": self.raw_gripper_commands,
+            "raw_spacemouse_samples": self.raw_spacemouse_samples,
+            "alignment_report": self.buffer_alignment_report,
             "rewards": [0.0] * len(self.actions),
             "camera_info": self.camera_info,
             "annotation_source": self.annotation_source,
             "image_annotation_mode": "none",
-            "obs_valid": np.ones(len(self.actions), dtype=np.bool_),
+            "obs_valid": np.asarray(
+                [
+                    index < len(self.observations)
+                    and self._parts_ready(self.observations[index])
+                    for index in range(len(self.actions))
+                ],
+                dtype=np.bool_,
+            ),
             "success": bool(success),
             "task": self.task_name,
             "furniture": self.task_name,
@@ -1857,21 +3550,27 @@ class RawEpisodeRecorder:
                 ),
                 "timebase": "unix_epoch_ns",
                 "controller_observation_alignment": (
-                    "offline screened/reordered action target-time grid"
+                    "offline direct-delta-command effect-time alignment"
                     if self.buffered_mode
                     else "raw observation stream plus action target-time master"
                 ),
                 "recording_frequency_hz": self.record_fps,
+                "spacemouse_sampling_frequency_hz": self.teleop_fps,
                 "action_period_ns": int(round(1e9 / self.record_fps)),
-                "episode_grid_start_wall_time_ns": self.action_timing[0].get(
-                    "episode_grid_start_wall_time_ns"
+                "episode_grid_start_wall_time_ns": (
+                    self.action_timing[0].get("episode_grid_start_wall_time_ns")
+                    if self.action_timing else self.grid_start_wall_time_ns
                 ),
                 "recording_includes_noop_actions": True,
+                "online_action_execution": "legacy_direct_delta_no_queue",
                 "timing_contract": (
-                    "camera source, robot/gripper receive, and command send times "
-                    "are buffered separately; action_target_timestamps_ns is the "
-                    "master grid; PromptDA and geometry annotation run only after "
-                    "screening and reordering"
+                    "legacy direct Deoxys delta commands, successful combined "
+                    "arm/gripper send "
+                    "times, camera exposure times, and robot/gripper receive times "
+                    "are buffered independently; send time plus calibrated device "
+                    "latency estimates effect time; actions use causal latest-effective "
+                    "hold on the fixed-rate master grid; PromptDA and annotation run "
+                    "only after materialization"
                     if self.buffered_mode
                     else "camera sensor source, PromptDA submit/start/ready, "
                     "robot/gripper state receive, and robot/gripper command send "
@@ -1890,8 +3589,13 @@ class RawEpisodeRecorder:
                 "max_command_lateness_ms": (
                     self.machine_time_schedule.dispatch_tolerance_ns / 1e6
                 ),
-                "action_latency_source": "estimated",
-                "action_latency_basis": "Deoxys/UMI command_latency=0.01s",
+                "action_latency_source": self.latency_profile.get(
+                    "latency_source", "measured_default"
+                ),
+                "action_latency_basis": self.latency_profile.get(
+                    "basis", "FrankaControl measured 2026-09-08 profile"
+                ),
+                "latency_profile": self.latency_profile or None,
                 "robot_observation_latency_ms": self.robot_observation_latency_ms,
                 "gripper_observation_latency_ms": (
                     self.gripper_observation_latency_ms
@@ -1929,21 +3633,44 @@ class RawEpisodeRecorder:
                 "prompt_depth_anything": self.prompt_depth_config,
                 "offline_buffer_alignment": self.buffer_alignment_report,
                 "offline_prompt_depth_report": self.prompt_depth_report,
+                "camera_sequence_gap_count": self.camera_sequence_gap_count,
             },
         }
+        if self.raw_failed_streams is not None:
+            payload["raw_camera_samples"] = self.raw_failed_streams["camera_samples"]
+            payload["raw_robot_states"] = self.raw_failed_streams["robot_states"]
+            payload["raw_gripper_states"] = self.raw_failed_streams["gripper_states"]
+            payload["metadata"]["raw_state_encoding"] = "protobuf_serialized_bytes"
         if self.annotation_session is not None:
-            self.annotation_session.update_trajectory_metadata(payload)
-            if self.buffered_mode:
-                payload["metadata"]["annotation_provenance"] = {
-                    "source": "scripted",
-                    "implementation": REAL_ANNOTATION_SOURCE,
-                    "stage": "after_target_time_selection",
-                    "rgb_pixels_modified": False,
-                }
-                payload["annotation_source"] = self.annotation_source
-        elif self.annotation_session_factory is not None:
+            try:
+                self.annotation_session.update_trajectory_metadata(payload)
+                if self.buffered_mode:
+                    payload["annotation_source"] = "scripted"
+                    payload["metadata"]["annotation_provenance"] = {
+                        "source": "scripted",
+                        "implementation": REAL_ANNOTATION_SOURCE,
+                        "stage": "after_target_time_selection",
+                        "rgb_pixels_modified": False,
+                    }
+            except Exception as exc:
+                self.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="annotation_metadata",
+                    traceback_text=traceback.format_exc(),
+                )
+                self.annotation_session = None
+        if self.annotation_session is None and self.annotation_session_factory is not None:
             for observation in payload["observations"]:
                 _clear_real_skill_annotation(observation)
+        if self.buffered_mode and self.annotation_session is None:
+            payload["annotation_source"] = "unannotated"
+            payload["metadata"]["real_skill_annotation"] = {
+                "source": REAL_ANNOTATION_SOURCE,
+                "mode": "offline",
+                "complete": False,
+                "error": self.annotation_error or "offline annotation was not configured",
+            }
+        elif self.annotation_session is None and self.annotation_session_factory is not None:
             payload["metadata"]["real_skill_annotation"] = {
                 "source": REAL_ANNOTATION_SOURCE,
                 "mode": "online",
@@ -1955,13 +3682,32 @@ class RawEpisodeRecorder:
                 audit = validate_buffered_payload(payload, self.annotation_session)
             except Exception as exc:
                 self.mark_buffer_error(
-                    f"save contract audit failed: {type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: {exc}",
+                    phase="save_contract",
+                    traceback_text=traceback.format_exc(),
                 )
-                logger.exception(
-                    "Buffered episode failed its save contract; press d to discard"
-                )
-                return None
-            payload["metadata"]["buffered_contract_audit"] = audit
+                payload["metadata"]["buffered_contract_audit"] = {
+                    "passed": False,
+                    "error": str(exc),
+                }
+            else:
+                payload["metadata"]["buffered_contract_audit"] = {
+                    **audit,
+                    "passed": True,
+                }
+            if self.quality_issues:
+                payload["metadata"]["schema"] = f"{BUFFERED_SCHEMA}_incomplete"
+        payload["save_quality"] = {
+            "status": "incomplete" if self.quality_issues else "complete",
+            "issues": [dict(issue) for issue in self.quality_issues],
+        }
+        if self.buffered_mode and self.quality_issues:
+            output_path = (
+                output_path.parent.parent
+                / "incomplete"
+                / outcome
+                / output_path.name
+            )
         self.writer.submit(output_path, payload)
         self.discard(log=False)
         return output_path
@@ -1988,8 +3734,16 @@ class RawEpisodeRecorder:
         self.robot_start_index = None
         self.gripper_start_index = None
         self.buffer_error = None
+        self.quality_issues = []
+        self.raw_failed_streams = None
         self.buffer_alignment_report = None
         self.prompt_depth_report = None
+        self.raw_arm_commands_absolute = []
+        self.raw_gripper_commands = []
+        self.raw_spacemouse_samples = []
+        self.grid_start_wall_time_ns = None
+        self.grid_end_wall_time_ns = None
+        self.camera_sequence_gap_count = 0
         if log:
             logger.info("Discarded episode with %d actions", action_count)
 
@@ -2056,6 +3810,43 @@ def scaled_deoxys_action(action, controller_cfg):
     return scaled
 
 
+def integrate_absolute_wrist_target(
+    target_pose, deoxys_delta_action, delta_controller_cfg, motion_scale
+):
+    """Apply one rate-normalized Deoxys delta to an absolute wrist target."""
+
+    target_pose = np.asarray(target_pose, dtype=np.float64).copy()
+    physical_delta = scaled_deoxys_action(
+        deoxys_delta_action, delta_controller_cfg
+    )
+    physical_delta[:6] *= float(motion_scale)
+    target_pose[:3, 3] += physical_delta[:3]
+    target_pose[:3, :3] = (
+        Rotation.from_rotvec(physical_delta[3:6]).as_matrix()
+        @ target_pose[:3, :3]
+    )
+    return target_pose, physical_delta
+
+
+def delta_wrist_command_to_absolute_target(scaled_action, wrist_pose):
+    """Describe one legacy Deoxys delta command as an auditable pose target."""
+
+    scaled_action = np.asarray(scaled_action, dtype=np.float64).reshape(7)
+    target_pose = np.asarray(wrist_pose, dtype=np.float64).reshape(4, 4).copy()
+    target_pose[:3, 3] += scaled_action[:3]
+    target_pose[:3, :3] = (
+        Rotation.from_rotvec(scaled_action[3:6]).as_matrix()
+        @ target_pose[:3, :3]
+    )
+    return np.concatenate(
+        [
+            target_pose[:3, 3],
+            Rotation.from_matrix(target_pose[:3, :3]).as_rotvec(),
+            [float(np.sign(scaled_action[-1]))],
+        ]
+    )
+
+
 def delta_action_to_absolute(action, robot_state):
     """Return ``[absolute xyz, absolute quat_xyzw, gripper]`` for validation."""
     delta = np.asarray(action, dtype=np.float64).reshape(8)
@@ -2076,6 +3867,11 @@ def delta_action_to_absolute(action, robot_state):
 
 def parse_args():
     default_data_root = os.environ.get("DATA_DIR_RAW")
+    default_latency_profile = os.environ.get(
+        "RR_LATENCY_PROFILE",
+        "/home/hz/code/robust-rearrangement-custom/src/real/"
+        "latency_profile.measured_20260908.json",
+    )
     default_interface_cfg = (
         Path(__file__).resolve().parents[1] / "config" / "charmander.yml"
     )
@@ -2147,15 +3943,29 @@ def parse_args():
     parser.add_argument("--record-image-height", type=int, default=240)
     parser.add_argument("--record-fps", type=float, default=10.0)
     parser.add_argument(
+        "--teleop-fps",
+        type=float,
+        default=30.0,
+        help="legacy compatibility; direct control uses FrankaInterface's 20 Hz",
+    )
+    parser.add_argument(
+        "--latency-profile",
+        default=default_latency_profile,
+        help=(
+            "measured RR latency profile; its arm/gripper action and state "
+            "observation values override the individual latency flags"
+        ),
+    )
+    parser.add_argument(
         "--robot-action-latency-ms",
         type=float,
-        default=10.0,
+        default=120.0,
         help="estimated arm command-to-effect latency used for target-time scheduling",
     )
     parser.add_argument(
         "--gripper-action-latency-ms",
         type=float,
-        default=10.0,
+        default=642.0,
         help="estimated gripper command-to-effect latency",
     )
     parser.add_argument(
@@ -2173,20 +3983,20 @@ def parse_args():
     parser.add_argument(
         "--robot-observation-latency-ms",
         type=float,
-        default=0.0,
+        default=0.067,
         help="estimated robot receive-time correction used by offline alignment",
     )
     parser.add_argument(
         "--gripper-observation-latency-ms",
         type=float,
-        default=0.0,
+        default=0.067,
         help="estimated gripper receive-time correction used by offline alignment",
     )
     parser.add_argument(
         "--camera-match-max-residual-ms",
         type=float,
-        default=45.0,
-        help="maximum per-camera residual during final target-time matching",
+        default=50.0,
+        help="camera residual warning threshold during offline matching",
     )
     parser.add_argument(
         "--camera-pair-max-skew-ms",
@@ -2195,16 +4005,22 @@ def parse_args():
         help="maximum front/wrist source-time skew after final matching",
     )
     parser.add_argument(
+        "--camera-hard-gap-ms",
+        type=float,
+        default=200.0,
+        help="per-camera coverage gap flagged incomplete without aborting offline matching",
+    )
+    parser.add_argument(
         "--robot-state-max-residual-ms",
         type=float,
         default=20.0,
-        help="maximum nearest robot-state residual around an interpolation target",
+        help="robot-state residual quality threshold during offline interpolation",
     )
     parser.add_argument(
         "--gripper-state-max-residual-ms",
         type=float,
         default=60.0,
-        help="maximum gripper-state residual during final target-time matching",
+        help="gripper-state residual quality threshold during final alignment",
     )
     # Deprecated compatibility flags. Timestamped v4 recording deliberately
     # keeps every fixed-rate no-op and therefore does not use either value.
@@ -2220,8 +4036,9 @@ def parse_args():
         "--real-skill-annotation",
         action="store_true",
         help=(
-            "preview the robust-rearrangement one_leg annotator live, then "
-            "recompute every saved skill/guidance annotation offline"
+            "preview RR real annotation for one_leg/round_table/lamp and "
+            "recompute it offline; annotation errors are recorded without "
+            "preventing an incomplete save"
         ),
     )
     parser.add_argument("--no-camera-preview", action="store_true")
@@ -2257,6 +4074,44 @@ def parse_args():
     parser.add_argument("--reset-tolerance", type=float, default=1e-3)
     parser.add_argument("--keep-gripper-closed-during-reset", action="store_true")
     args = parser.parse_args()
+    args.latency_profile_data = {}
+    if args.latency_profile:
+        latency_profile_path = Path(args.latency_profile).expanduser()
+        if not latency_profile_path.is_file():
+            parser.error(f"--latency-profile does not exist: {latency_profile_path}")
+        try:
+            latency_profile = json.loads(latency_profile_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"could not read --latency-profile: {exc}")
+        required_latency_fields = (
+            "robot_action_ms",
+            "gripper_action_ms",
+            "robot_observation_ms",
+            "gripper_observation_ms",
+        )
+        missing = [
+            field for field in required_latency_fields if field not in latency_profile
+        ]
+        if missing:
+            parser.error(
+                "--latency-profile is missing fields: " + ", ".join(missing)
+            )
+        args.robot_action_latency_ms = float(latency_profile["robot_action_ms"])
+        args.gripper_action_latency_ms = float(
+            latency_profile["gripper_action_ms"]
+        )
+        args.robot_observation_latency_ms = float(
+            latency_profile["robot_observation_ms"]
+        )
+        args.gripper_observation_latency_ms = float(
+            latency_profile["gripper_observation_ms"]
+        )
+        if "action_stale_guard_ms" in latency_profile:
+            args.action_stale_guard_ms = float(
+                latency_profile["action_stale_guard_ms"]
+            )
+        args.latency_profile = str(latency_profile_path.resolve())
+        args.latency_profile_data = latency_profile
     if args.product_id is None:
         args.product_id = SPACEMOUSE_PRODUCT_IDS[args.spacemouse_connection]
     if not args.data_root:
@@ -2274,6 +4129,8 @@ def parse_args():
     args.interface_cfg = str(interface_cfg.resolve())
     if args.record_fps <= 0:
         parser.error("--record-fps must be greater than zero")
+    if args.teleop_fps <= 0:
+        parser.error("--teleop-fps must be greater than zero")
     for name in (
         "robot_action_latency_ms",
         "gripper_action_latency_ms",
@@ -2283,6 +4140,7 @@ def parse_args():
         "gripper_observation_latency_ms",
         "camera_match_max_residual_ms",
         "camera_pair_max_skew_ms",
+        "camera_hard_gap_ms",
         "robot_state_max_residual_ms",
         "gripper_state_max_residual_ms",
     ):
@@ -2293,10 +4151,6 @@ def parse_args():
         resolve_eepose_frame(args.eepose_frame)
     except ValueError as exc:
         parser.error(str(exc))
-    if args.real_skill_annotation and args.task_name != "one_leg":
-        parser.error(
-            "--real-skill-annotation currently supports only --task-name one_leg"
-        )
     return args
 
 
@@ -2306,11 +4160,10 @@ def main():
     prompt_depth_estimator = None
     prompt_depth_cameras = ()
     prompt_depth_config = None
+    prompt_depth_startup_error = None
     annotation_session_factory = None
-    preview_annotation_session = None
-    preview_annotation_error = None
-    preview_annotation_capture_ns = None
-    last_annotation_observation = None
+    preview_worker = None
+    camera_collector = None
     episode = None
     writer = EpisodeWriter(
         video_fps=args.record_fps,
@@ -2318,7 +4171,7 @@ def main():
     )
     device = None
     robot_interface = None
-    controller_cfg = None
+    delta_controller_cfg = None
     startup_stage = "dual_realsense_initialization"
     try:
         logger.info(
@@ -2352,23 +4205,19 @@ def main():
         startup_stage = "real_skill_annotation_initialization"
         if args.real_skill_annotation:
             annotation_session_factory = _create_real_skill_annotation_session
-            if not args.no_camera_preview:
-                preview_annotation_session = annotation_session_factory(
-                    args.task_name, camera_info
-                )
+        else:
+            logger.warning(
+                "No real annotation session is configured for task=%s. "
+                "Pickles will be saved as incomplete/unannotated. "
+                "Add --real-skill-annotation to enable offline annotation.",
+                args.task_name,
+            )
         startup_stage = "prompt_depth_initialization"
         if args.prompt_depth_anything:
             prompt_depth_cameras = (
                 ("wrist", "front")
                 if args.prompt_depth_cameras == "both"
                 else (args.prompt_depth_cameras,)
-            )
-            prompt_depth_estimator = PromptDepthAnythingEstimator(
-                model=args.prompt_depth_model,
-                device=args.prompt_depth_device,
-                max_size=args.prompt_depth_max_size,
-                min_depth_m=args.prompt_depth_min_m,
-                max_depth_m=args.prompt_depth_max_m,
             )
             prompt_depth_config = {
                 "online": False,
@@ -2382,6 +4231,29 @@ def main():
                 ],
                 "original_depth_suffix": "_realsense",
             }
+            try:
+                prompt_depth_estimator = PromptDepthAnythingEstimator(
+                    model=args.prompt_depth_model,
+                    device=args.prompt_depth_device,
+                    max_size=args.prompt_depth_max_size,
+                    min_depth_m=args.prompt_depth_min_m,
+                    max_depth_m=args.prompt_depth_max_m,
+                )
+            except Exception as exc:
+                prompt_depth_startup_error = f"{type(exc).__name__}: {exc}"
+                prompt_depth_config["initialization_error"] = (
+                    prompt_depth_startup_error
+                )
+                logger.exception(
+                    "PromptDA initialization failed; raw RGBD collection "
+                    "can continue and be saved as incomplete"
+                )
+        if set(prompt_depth_cameras) != {"front", "wrist"}:
+            logger.warning(
+                "Offline PromptDA is not configured for both cameras. "
+                "Pickles will be saved as incomplete. "
+                "Add --prompt-depth-anything --prompt-depth-cameras both."
+            )
         startup_stage = "episode_recorder_initialization"
         episode = RawEpisodeRecorder(
             data_root=args.data_root,
@@ -2393,12 +4265,14 @@ def main():
             annotation_session_factory=annotation_session_factory,
             eepose_frame=args.eepose_frame,
             record_fps=args.record_fps,
+            teleop_fps=20.0,
             robot_action_latency_ms=args.robot_action_latency_ms,
             gripper_action_latency_ms=args.gripper_action_latency_ms,
             action_stale_guard_ms=args.action_stale_guard_ms,
             max_command_lateness_ms=args.max_command_lateness_ms,
             robot_observation_latency_ms=args.robot_observation_latency_ms,
             gripper_observation_latency_ms=args.gripper_observation_latency_ms,
+            latency_profile=args.latency_profile_data,
             output_suffix=args.output_suffix,
             annotation_source=args.annotation_source,
         )
@@ -2414,12 +4288,8 @@ def main():
         device.start_control()
         startup_stage = "franka_interface_initialization"
         logger.info("Startup stage=%s", startup_stage)
-        robot_interface = FrankaInterface(
-            args.interface_cfg,
-            control_freq=args.record_fps,
-            use_visualizer=False,
-        )
-        controller_cfg = get_default_controller_config(args.controller_type)
+        robot_interface = FrankaInterface(args.interface_cfg, use_visualizer=False)
+        delta_controller_cfg = get_default_controller_config(args.controller_type)
         joint_controller_cfg = get_default_controller_config("JOINT_POSITION")
         robot_interface.reset()
         startup_stage = "robot_state_wait"
@@ -2433,9 +4303,24 @@ def main():
         robot_interface.control(
             controller_type=args.controller_type,
             action=np.array([0.0] * 6 + [-1.0], dtype=np.float64),
-            controller_cfg=controller_cfg,
+            controller_cfg=delta_controller_cfg,
             control_gripper=False,
-            enforce_control_frequency=False,
+        )
+        preview_worker = AsyncObservationPreview(
+            camera=camera,
+            robot_interface=robot_interface,
+            camera_info=camera_info,
+            eepose_frame=args.eepose_frame,
+            task_name=args.task_name,
+            draw_part_poses=args.draw_part_poses,
+            annotation_session_factory=annotation_session_factory,
+            enable_annotation=(
+                args.real_skill_annotation and not args.no_camera_preview
+            ),
+            show_window=not args.no_camera_preview,
+            depth_min_m=args.prompt_depth_min_m,
+            depth_max_m=args.prompt_depth_display_max_m,
+            depth_colormap=args.prompt_depth_colormap,
         )
 
         startup_stage = "control_loop"
@@ -2444,277 +4329,154 @@ def main():
             "Keys: b=begin, e=end, s=save success, f=save failure, "
             "d=discard, r=reset joints, p=toggle part poses, q=quit"
         )
-        record_period = 1.0 / args.record_fps
         record_period_ns = int(round(1e9 / args.record_fps))
-        sample_lead_s = max(
-            0.01,
-            episode.machine_time_schedule.common_admission_lead_ns / 1e9
-            - record_period
-            + 0.005,
-        )
-        grid_start_monotonic = None
-        grid_start_wall_time_ns = None
-        grid_index = 0
-        pending_command = None
-        camera_history_cursor = None
+        recording_start_due_monotonic = None
+        camera_preroll_s = 3.0
+        camera_postroll_s = 1.0
         draw_part_poses = bool(args.draw_part_poses)
+        last_loop_phase_ms = {}
+        worst_loop_phase_ms = {}
+        direct_action_sample_index = 0
+        control_fault = False
 
-        def drain_camera_buffer():
-            nonlocal camera_history_cursor
-            if episode.state != "recording" or not episode.buffered_mode:
+        def stop_camera_collector():
+            nonlocal camera_collector
+            if camera_collector is None:
                 return
-            try:
-                samples, camera_history_cursor = camera.samples_since(
-                    camera_history_cursor
-                )
-                episode.add_camera_samples(samples)
-            except Exception as exc:
-                episode.mark_buffer_error(
-                    f"camera history drain failed: {type(exc).__name__}: {exc}"
-                )
+            camera_collector.stop()
+            camera_collector = None
 
         def stop_buffered_episode():
-            drain_camera_buffer()
-            return episode.stop_buffered(
-                robot_interface.timestamped_robot_state_buffer(),
-                robot_interface.timestamped_gripper_state_buffer(),
-                prompt_depth_estimator=prompt_depth_estimator,
-                prompt_depth_cameras=prompt_depth_cameras,
-                camera_max_residual_ms=args.camera_match_max_residual_ms,
-                camera_pair_max_skew_ms=args.camera_pair_max_skew_ms,
-                robot_max_residual_ms=args.robot_state_max_residual_ms,
-                gripper_max_residual_ms=args.gripper_state_max_residual_ms,
-            )
-
-        def cancel_pending_command(reason):
-            nonlocal pending_command
-            if pending_command is None:
-                return
-            timing = dict(pending_command["timing"])
-            timing.update(
-                status="dropped",
-                drop_reason=reason,
-                dropped_wall_time_ns=time.time_ns(),
-            )
-            episode.record_dropped_command(
-                timing,
-                invalidate_continuity=reason not in {
-                    "operator_stopped_episode",
-                    "operator_discarded_episode",
-                    "operator_quit",
-                    "spacemouse_stop",
-                },
-            )
-            pending_command = None
-
-        def dispatch_pending_command(now_monotonic):
-            nonlocal pending_command
-            if pending_command is None:
-                return
-            schedule = episode.machine_time_schedule
-            target_wall_time_ns = pending_command["target_wall_time_ns"]
-            channels = sorted(
-                ("robot", "gripper"),
-                key=lambda channel: pending_command[f"{channel}_deadline_monotonic"],
-            )
-            for channel in channels:
-                if pending_command[f"{channel}_sent"]:
-                    continue
-                deadline_monotonic = pending_command[
-                    f"{channel}_deadline_monotonic"
-                ]
-                if now_monotonic < deadline_monotonic:
-                    continue
-                dispatch_wall_time_ns = time.time_ns()
-                if schedule.dispatch_expired(
-                    target_wall_time_ns,
-                    dispatch_wall_time_ns,
-                    channel,
-                ):
-                    partial = bool(
-                        pending_command["robot_sent"]
-                        or pending_command["gripper_sent"]
-                    )
-                    timing = dict(pending_command["timing"])
-                    timing.update(
-                        status="partial_dispatch_failure" if partial else "dropped",
-                        drop_reason=f"stale_{channel}_deadline",
-                        dropped_wall_time_ns=dispatch_wall_time_ns,
-                    )
-                    episode.record_dropped_command(timing)
-                    pending_command = None
-                    if partial:
-                        raise RuntimeError(
-                            "coordinated command became stale after one channel sent"
-                        )
-                    return
-                if channel == "robot":
-                    result = robot_interface.control(
-                        controller_type=args.controller_type,
-                        action=pending_command["deoxys_action"].copy(),
-                        controller_cfg=controller_cfg,
-                        control_gripper=False,
-                        enforce_control_frequency=False,
-                    )
-                    send_wall_time_ns = result["robot_command_wall_time_ns"]
-                else:
-                    robot_interface.gripper_control(
-                        float(pending_command["deoxys_action"][-1])
-                    )
-                    send_wall_time_ns = (
-                        robot_interface.last_gripper_command_wall_time_ns
-                    )
-                pending_command[f"{channel}_sent"] = True
-                pending_command["timing"][
-                    f"{channel}_command_wall_time_ns"
-                ] = send_wall_time_ns
-                pending_command["timing"][f"{channel}_send_residual_ms"] = (
-                    send_wall_time_ns - target_wall_time_ns
-                ) / 1e6
-                now_monotonic = time.monotonic()
-
-            if pending_command is not None and all(
-                pending_command[f"{channel}_sent"]
-                for channel in ("robot", "gripper")
-            ):
-                pending_command["timing"]["status"] = "executed"
-                episode.append_buffered(
-                    pending_command["scaled_action"],
-                    action_timing=pending_command["timing"],
+            try:
+                stop_camera_collector()
+            except Exception as exc:
+                episode.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="camera_collector_stop",
+                    traceback_text=traceback.format_exc(),
                 )
-                pending_command = None
+            try:
+                duplicate_counts = camera.duplicate_frame_counts()
+                logger.info(
+                    "Camera duplicate frames skipped before queue: front=%s wrist=%s",
+                    duplicate_counts["front"],
+                    duplicate_counts["wrist"],
+                )
+            except Exception as exc:
+                episode.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="camera_diagnostics",
+                    traceback_text=traceback.format_exc(),
+                )
+            try:
+                robot_records = robot_interface.timestamped_robot_state_buffer()
+            except Exception as exc:
+                robot_records = []
+                episode.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="robot_state_buffer",
+                    traceback_text=traceback.format_exc(),
+                )
+            try:
+                gripper_records = robot_interface.timestamped_gripper_state_buffer()
+            except Exception as exc:
+                gripper_records = []
+                episode.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="gripper_state_buffer",
+                    traceback_text=traceback.format_exc(),
+                )
+            try:
+                return episode.stop_buffered(
+                    robot_records,
+                    gripper_records,
+                    prompt_depth_estimator=prompt_depth_estimator,
+                    prompt_depth_cameras=prompt_depth_cameras,
+                    camera_max_residual_ms=args.camera_match_max_residual_ms,
+                    camera_pair_max_skew_ms=args.camera_pair_max_skew_ms,
+                    camera_hard_gap_ms=args.camera_hard_gap_ms,
+                    robot_max_residual_ms=args.robot_state_max_residual_ms,
+                    gripper_max_residual_ms=args.gripper_state_max_residual_ms,
+                )
+            except Exception as exc:
+                episode.mark_buffer_error(
+                    f"{type(exc).__name__}: {exc}",
+                    phase="offline_processing",
+                    traceback_text=traceback.format_exc(),
+                )
+                episode.stopped_at = datetime.now().isoformat(timespec="milliseconds")
+                episode.state = "pending_save"
+                episode.raw_failed_streams = {
+                    "camera_samples": episode.camera_samples,
+                    "robot_states": _serializable_raw_state_records(robot_records),
+                    "gripper_states": _serializable_raw_state_records(gripper_records),
+                }
+                logger.exception("Offline processing failed; raw streams can still be saved")
+                return False
 
         with NonBlockingKeyReader() as key_reader:
             running = True
             while running:
-                drain_camera_buffer()
-                camera_sample = camera.latest()
-                prompt_result = None
-                observation = build_observation(
-                    robot_interface,
-                    camera_sample,
-                    args.eepose_frame,
-                )
-                annotation_observation = None
-                if (
-                    args.real_skill_annotation
-                    and not args.no_camera_preview
-                    and observation is not None
-                ):
-                    # This session is preview-only, including while recording.
-                    # The payload is still reconstructed and annotated from the
-                    # timestamp-aligned buffers after ``e``; never let this
-                    # online FSM mutate or stand in for saved annotations.
-                    capture_ns = observation.get("camera_capture_wall_time_ns")
-                    if (
-                        capture_ns is None
-                        or capture_ns != preview_annotation_capture_ns
-                    ):
-                        if preview_annotation_session is None:
-                            preview_annotation_session = annotation_session_factory(
-                                args.task_name, camera_info
-                            )
-                        try:
-                            preview_annotation_session.annotate_observation(observation)
-                            last_annotation_observation = observation
-                            preview_annotation_capture_ns = capture_ns
-                            preview_annotation_error = None
-                        except Exception as exc:
-                            message = f"{type(exc).__name__}: {exc}"
-                            if message != preview_annotation_error:
-                                logger.warning(
-                                    "Live annotation is waiting for usable poses: %s",
-                                    message,
-                                )
-                                preview_annotation_error = message
-                            preview_annotation_session = None
-                            last_annotation_observation = None
-                    annotation_observation = last_annotation_observation
-                keys = key_reader.read_keys()
-                if not args.no_camera_preview:
-                    preview_sample = camera_sample
-                    if prompt_result is not None and prompt_result.get("depths"):
-                        preview_sample = prompt_result["camera_sample"]
-                    preview = _build_camera_preview(
-                        preview_sample,
-                        camera_info,
-                        episode.state,
-                        draw_part_poses,
-                        task_name=args.task_name,
-                        annotation_observation=annotation_observation,
-                        prompt_depth_result=prompt_result,
-                        depth_min_m=args.prompt_depth_min_m,
-                        depth_max_m=args.prompt_depth_display_max_m,
-                        depth_colormap=args.prompt_depth_colormap,
+                loop_start_monotonic = time.monotonic()
+                after_dispatch = time.monotonic()
+                preview_state = episode.state
+                if recording_start_due_monotonic is not None:
+                    remaining_s = recording_start_due_monotonic - time.monotonic()
+                    preview_state = (
+                        f"arming {remaining_s:.1f}s"
+                        if remaining_s > 0
+                        else "waiting poses"
                     )
-                    if preview is not None:
-                        cv2.imshow(PREVIEW_WINDOW_NAME, preview)
-                        window_key = cv2.waitKey(1) & 0xFF
-                        if window_key in map(ord, "besfdrpq"):
-                            keys.append(chr(window_key))
+                preview_worker.draw_part_poses = draw_part_poses
+                preview_worker.pump(preview_state)
+                observation = preview_worker.latest_observation
+                keys = key_reader.read_keys() + preview_worker.read_window_keys()
+                after_keys_read = time.monotonic()
                 for key in keys:
                     if key == "b":
-                        camera_history_cursor = camera.history_cursor()
-                        if episode.begin_buffered(
-                            observation,
-                            camera_start_sequence=camera_history_cursor,
-                            robot_start_index=len(
-                                robot_interface.timestamped_robot_state_buffer()
-                            ),
-                            gripper_start_index=len(
-                                robot_interface.timestamped_gripper_state_buffer()
-                            ),
-                        ):
-                            if (
-                                annotation_session_factory is not None
-                                and not args.no_camera_preview
-                            ):
-                                preview_annotation_session = annotation_session_factory(
-                                    args.task_name, camera_info
-                                )
-                                preview_annotation_capture_ns = None
-                                last_annotation_observation = None
-                            grid_start_monotonic = time.monotonic()
-                            grid_start_wall_time_ns = time.time_ns()
-                            grid_index = 0
-                            pending_command = None
+                        if control_fault:
+                            logger.warning("Robot control fault: save/discard, then quit")
+                        elif episode.state != "idle":
+                            logger.warning("Save or discard the current episode before b")
+                        elif recording_start_due_monotonic is not None:
+                            logger.warning("Camera preparation is already in progress")
+                        else:
+                            recording_start_due_monotonic = (
+                                time.monotonic() + camera_preroll_s
+                            )
+                            logger.info(
+                                "Camera preparation started; recording begins in %.1f s",
+                                camera_preroll_s,
+                            )
                     elif key == "e":
-                        cancel_pending_command("operator_stopped_episode")
-                        stop_buffered_episode()
+                        if recording_start_due_monotonic is not None:
+                            recording_start_due_monotonic = None
+                            logger.info("Camera preparation cancelled; no episode was recorded")
+                        elif episode.state == "recording":
+                            episode.grid_end_wall_time_ns = time.time_ns()
+                            logger.info(
+                                "Actions stopped; collecting %.1f s of camera post-roll",
+                                camera_postroll_s,
+                            )
+                            time.sleep(camera_postroll_s)
+                            stop_buffered_episode()
+                            try:
+                                device.start_control(preserve_gripper=True)
+                            except TypeError:
+                                device.start_control()
+                        else:
+                            logger.warning("No episode is recording")
                     elif key == "s":
                         episode.save(success=True)
-                        if (
-                            annotation_session_factory is not None
-                            and not args.no_camera_preview
-                        ):
-                            preview_annotation_session = annotation_session_factory(
-                                args.task_name, camera_info
-                            )
-                            preview_annotation_capture_ns = None
-                            last_annotation_observation = None
+                        preview_worker.request_annotation_reset()
                     elif key == "f":
                         episode.save(success=False)
-                        if (
-                            annotation_session_factory is not None
-                            and not args.no_camera_preview
-                        ):
-                            preview_annotation_session = annotation_session_factory(
-                                args.task_name, camera_info
-                            )
-                            preview_annotation_capture_ns = None
-                            last_annotation_observation = None
+                        preview_worker.request_annotation_reset()
                     elif key == "d":
-                        cancel_pending_command("operator_discarded_episode")
+                        recording_start_due_monotonic = None
+                        stop_camera_collector()
                         episode.discard()
-                        if (
-                            annotation_session_factory is not None
-                            and not args.no_camera_preview
-                        ):
-                            preview_annotation_session = annotation_session_factory(
-                                args.task_name, camera_info
-                            )
-                            preview_annotation_capture_ns = None
-                            last_annotation_observation = None
+                        preview_worker.request_annotation_reset()
                     elif key == "p":
                         draw_part_poses = not draw_part_poses
                         logger.info(
@@ -2722,11 +4484,19 @@ def main():
                             "enabled" if draw_part_poses else "disabled",
                         )
                     elif key == "q":
-                        cancel_pending_command("operator_quit")
+                        recording_start_due_monotonic = None
+                        stop_camera_collector()
                         running = False
                     elif key == "r":
-                        if episode.state == "recording":
-                            logger.warning("Joint reset is disabled while recording")
+                        if control_fault:
+                            logger.warning("Joint reset is disabled after a control fault")
+                        elif (
+                            episode.state == "recording"
+                            or recording_start_due_monotonic is not None
+                        ):
+                            logger.warning(
+                                "Joint reset is disabled while recording or preparing"
+                            )
                         else:
                             move_to_reset_joint_positions(
                                 robot_interface,
@@ -2740,106 +4510,109 @@ def main():
                             device.start_control()
                 if not running:
                     break
+                if control_fault:
+                    time.sleep(0.02)
+                    continue
 
-                now = time.monotonic()
-                if episode.state == "recording":
-                    dispatch_pending_command(now)
-                    cycle_end = grid_start_monotonic + (grid_index + 1) * record_period
-                    sample_time = cycle_end - sample_lead_s
-                    target_monotonic = cycle_end + record_period
-                    if now < sample_time or pending_command is not None:
-                        continue
-                    while now >= sample_time + record_period:
-                        missed_target_wall_time_ns = monotonic_target_to_wall_time_ns(
-                            target_monotonic,
-                            monotonic_now_s=grid_start_monotonic,
-                            wall_now_ns=grid_start_wall_time_ns,
-                        )
-                        episode.record_dropped_command(
-                            {
-                                "action_target_wall_time_ns": (
-                                    missed_target_wall_time_ns
-                                ),
-                                "episode_grid_start_wall_time_ns": (
-                                    grid_start_wall_time_ns
-                                ),
-                                "grid_index": grid_index + 2,
-                                "action_period_ns": record_period_ns,
-                                "status": "missing_grid",
-                                "drop_reason": "control_loop_missed_grid",
-                                "dropped_wall_time_ns": time.time_ns(),
-                            }
-                        )
-                        grid_index += 1
-                        cycle_end += record_period
-                        sample_time += record_period
-                        target_monotonic += record_period
-
-                    action, _ = input2action(
+                if (
+                    recording_start_due_monotonic is not None
+                    and time.monotonic() >= recording_start_due_monotonic
+                    and observation is not None
+                ):
+                    recording_start_due_monotonic = None
+                    camera_history_cursor = camera.history_cursor()
+                    initial_wrist_pose = np.asarray(
+                        observation["robot_state"]["wrist_pose"], dtype=np.float64
+                    ).copy()
+                    initial_input_action, _ = input2action(
                         device=device,
                         controller_type=args.controller_type,
                     )
-                    if action is None:
-                        cancel_pending_command("spacemouse_stop")
-                        stop_buffered_episode()
-                        try:
-                            device.start_control(preserve_gripper=True)
-                        except TypeError:
-                            device.start_control()
-                        continue
-                    scaled_action = scaled_deoxys_action(action, controller_cfg)
-                    target_wall_time_ns = monotonic_target_to_wall_time_ns(
-                        target_monotonic,
-                        monotonic_now_s=grid_start_monotonic,
-                        wall_now_ns=grid_start_wall_time_ns,
-                    )
-                    generated_wall_time_ns = time.time_ns()
-                    schedule = episode.machine_time_schedule
-                    timing = {
-                        "action_target_wall_time_ns": target_wall_time_ns,
-                        "action_generated_wall_time_ns": generated_wall_time_ns,
-                        "episode_grid_start_wall_time_ns": grid_start_wall_time_ns,
-                        "grid_index": grid_index + 2,
-                        "action_period_ns": record_period_ns,
-                        "robot_command_deadline_wall_time_ns": schedule.deadline_ns(
-                            target_wall_time_ns, "robot"
-                        ),
-                        "gripper_command_deadline_wall_time_ns": schedule.deadline_ns(
-                            target_wall_time_ns, "gripper"
-                        ),
-                        "observation_ready_wall_time_ns": (
-                            None
-                            if observation is None
-                            else observation.get("observation_ready_wall_time_ns")
-                        ),
-                    }
-                    if not schedule.admit(
-                        target_wall_time_ns,
-                        generated_wall_time_ns,
-                    ):
-                        timing.update(
-                            status="dropped",
-                            drop_reason="stale_at_admission",
-                            dropped_wall_time_ns=generated_wall_time_ns,
+                    if initial_input_action is None:
+                        logger.warning(
+                            "Recording start cancelled because SpaceMouse requested reset"
                         )
-                        episode.record_dropped_command(timing)
-                        grid_index += 1
+                        device.start_control()
                         continue
-                    pending_command = {
-                        "target_wall_time_ns": target_wall_time_ns,
-                        "robot_deadline_monotonic": target_monotonic
-                        - schedule.robot_action_latency_ns / 1e9,
-                        "gripper_deadline_monotonic": target_monotonic
-                        - schedule.gripper_action_latency_ns / 1e9,
-                        "robot_sent": False,
-                        "gripper_sent": False,
-                        "deoxys_action": np.asarray(
-                            action, dtype=np.float64
-                        ).copy(),
-                        "scaled_action": scaled_action,
-                        "timing": timing,
+                    initial_gripper_action = float(
+                        np.sign(initial_input_action[-1])
+                    )
+                    initial_absolute_wrist_action = np.concatenate(
+                        [
+                            initial_wrist_pose[:3, 3],
+                            Rotation.from_matrix(
+                                initial_wrist_pose[:3, :3]
+                            ).as_rotvec(),
+                            [initial_gripper_action],
+                        ]
+                    )
+                    grid_start_wall_time_ns = time.time_ns()
+                    if episode.begin_buffered(
+                        observation,
+                        camera_start_sequence=camera_history_cursor,
+                        robot_start_index=len(
+                            robot_interface.timestamped_robot_state_buffer()
+                        ),
+                        gripper_start_index=len(
+                            robot_interface.timestamped_gripper_state_buffer()
+                        ),
+                        grid_start_wall_time_ns=grid_start_wall_time_ns,
+                        initial_absolute_wrist_action=(
+                            initial_absolute_wrist_action
+                        ),
+                        initial_gripper_action=initial_gripper_action,
+                    ):
+                        if prompt_depth_startup_error is not None:
+                            episode.mark_buffer_error(
+                                prompt_depth_startup_error,
+                                phase="prompt_depth_initialization",
+                            )
+                        preview_worker.request_annotation_reset()
+                        camera_collector = AsyncCameraBufferCollector(
+                            camera=camera,
+                            episode=episode,
+                            history_cursor=camera_history_cursor,
+                        ).start()
+                        worst_loop_phase_ms = {}
+                        logger.info(
+                            "Legacy direct SpaceMouse control_hz=20.0 output_hz=%.1f "
+                            "robot_latency_ms=%.3f gripper_latency_ms=%.3f preview=%s "
+                            "draw_part_poses=%s live_skill=%s",
+                            args.record_fps,
+                            episode.machine_time_schedule.robot_action_latency_ns / 1e6,
+                            episode.machine_time_schedule.gripper_action_latency_ns / 1e6,
+                            not args.no_camera_preview,
+                            draw_part_poses,
+                            args.real_skill_annotation,
+                        )
+
+                now = time.monotonic()
+                if episode.state == "recording":
+                    last_loop_phase_ms = {
+                        "dispatch": round(
+                            (after_dispatch - loop_start_monotonic) * 1e3, 3
+                        ),
+                        "camera_drain": round(
+                            0.0, 3
+                        ),
+                        "async_preview_pump_and_key_read": round(
+                            (after_keys_read - after_dispatch) * 1e3, 3
+                        ),
+                        "key_handling": round((now - after_keys_read) * 1e3, 3),
+                        "total": round((now - loop_start_monotonic) * 1e3, 3),
                     }
-                    grid_index += 1
+                    if last_loop_phase_ms["total"] > worst_loop_phase_ms.get("total", 0):
+                        worst_loop_phase_ms = dict(last_loop_phase_ms)
+                    if last_loop_phase_ms["total"] > 15.0:
+                        logger.warning(
+                            "Timing probe slow UI loop phases_ms=%s",
+                            last_loop_phase_ms,
+                        )
+
+                if recording_start_due_monotonic is not None:
+                    # The HID listener may update its current axes, but no
+                    # SpaceMouse action is sampled or sent during preparation.
+                    time.sleep(0.01)
                     continue
 
                 action, _ = input2action(
@@ -2847,12 +4620,126 @@ def main():
                     controller_type=args.controller_type,
                 )
                 if action is None:
+                    if episode.state == "recording":
+                        episode.grid_end_wall_time_ns = time.time_ns()
+                        logger.info(
+                            "SpaceMouse stopped recording; collecting %.1f s of "
+                            "camera post-roll",
+                            camera_postroll_s,
+                        )
+                        time.sleep(camera_postroll_s)
+                        stop_buffered_episode()
+                        try:
+                            device.start_control(preserve_gripper=True)
+                        except TypeError:
+                            device.start_control()
+                        continue
                     break
-                robot_interface.control(
-                    controller_type=args.controller_type,
-                    action=np.asarray(action, dtype=np.float64).copy(),
-                    controller_cfg=controller_cfg,
+                sample_wall_time_ns = time.time_ns()
+                scaled_action = scaled_deoxys_action(
+                    action, delta_controller_cfg
                 )
+                wrist_pose = robot_interface.last_eef_pose
+                if wrist_pose is None and observation is not None:
+                    wrist_pose = observation["robot_state"]["wrist_pose"]
+                if wrist_pose is None:
+                    raise RuntimeError(
+                        "robot wrist pose is unavailable for direct action audit"
+                    )
+                absolute_wrist_action = delta_wrist_command_to_absolute_target(
+                    scaled_action,
+                    wrist_pose,
+                )
+                if episode.state == "recording":
+                    episode.record_raw_spacemouse_sample(
+                        {
+                            "sample_index": direct_action_sample_index,
+                            "sample_wall_time_ns": sample_wall_time_ns,
+                            "raw_deoxys_delta_action": np.asarray(
+                                action, dtype=np.float64
+                            ).copy(),
+                            "scaled_physical_delta": np.asarray(
+                                scaled_action, dtype=np.float64
+                            ).copy(),
+                            "absolute_wrist_action": absolute_wrist_action.copy(),
+                        }
+                    )
+                control_started = time.monotonic()
+                try:
+                    command_timing = robot_interface.control(
+                        controller_type=args.controller_type,
+                        action=np.asarray(action, dtype=np.float64).copy(),
+                        controller_cfg=delta_controller_cfg,
+                    )
+                except Exception as exc:
+                    if episode.state != "recording":
+                        raise
+                    episode.mark_buffer_error(
+                        f"{type(exc).__name__}: {exc}",
+                        phase="robot_control",
+                        traceback_text=traceback.format_exc(),
+                    )
+                    episode.grid_end_wall_time_ns = time.time_ns()
+                    stop_buffered_episode()
+                    control_fault = True
+                    logger.exception(
+                        "Robot control stopped; no further actions will be sent. "
+                        "Press s/f to save the incomplete episode, then q to quit."
+                    )
+                    continue
+                control_elapsed_ms = (
+                    time.monotonic() - control_started
+                ) * 1e3
+                if episode.state == "recording":
+                    arm_command_wall_time_ns = int(
+                        command_timing["robot_command_wall_time_ns"]
+                    )
+                    episode.record_raw_dispatch(
+                        {
+                            "channel": "robot",
+                            "status": "executed",
+                            "sample_index": direct_action_sample_index,
+                            "sample_wall_time_ns": sample_wall_time_ns,
+                            "command_wall_time_ns": arm_command_wall_time_ns,
+                            "predicted_effect_wall_time_ns": (
+                                arm_command_wall_time_ns
+                                + episode.machine_time_schedule.robot_action_latency_ns
+                            ),
+                            "control_elapsed_ms": control_elapsed_ms,
+                            "absolute_wrist_action": absolute_wrist_action.copy(),
+                            "raw_deoxys_delta_action": np.asarray(
+                                action, dtype=np.float64
+                            ).copy(),
+                            "scaled_physical_delta": np.asarray(
+                                scaled_action, dtype=np.float64
+                            ).copy(),
+                        }
+                    )
+                    gripper_command_wall_time_ns = command_timing.get(
+                        "gripper_command_wall_time_ns"
+                    )
+                    if gripper_command_wall_time_ns is not None:
+                        gripper_command_wall_time_ns = int(
+                            gripper_command_wall_time_ns
+                        )
+                        episode.record_raw_dispatch(
+                            {
+                                "channel": "gripper",
+                                "status": "executed",
+                                "sample_index": direct_action_sample_index,
+                                "sample_wall_time_ns": sample_wall_time_ns,
+                                "command_wall_time_ns": (
+                                    gripper_command_wall_time_ns
+                                ),
+                                "predicted_effect_wall_time_ns": (
+                                    gripper_command_wall_time_ns
+                                    + episode.machine_time_schedule.gripper_action_latency_ns
+                                ),
+                                "control_elapsed_ms": control_elapsed_ms,
+                                "gripper_action": float(np.sign(action[-1])),
+                            }
+                        )
+                direct_action_sample_index += 1
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
     except Exception:
@@ -2861,14 +4748,18 @@ def main():
     finally:
         if episode is not None and episode.state != "idle":
             logger.warning("Unsaved in-memory episode was discarded on exit")
+        if camera_collector is not None:
+            stop_camera_collector()
+        if preview_worker is not None:
+            preview_worker.close()
         try:
             if robot_interface is not None:
                 try:
-                    if controller_cfg is not None:
+                    if delta_controller_cfg is not None:
                         robot_interface.control(
                             controller_type=args.controller_type,
                             action=np.array([0.0] * 6 + [1.0]),
-                            controller_cfg=controller_cfg,
+                            controller_cfg=delta_controller_cfg,
                             termination=True,
                         )
                 finally:

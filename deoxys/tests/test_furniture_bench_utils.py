@@ -1,5 +1,6 @@
 import threading
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -34,6 +35,102 @@ class DualRealSenseShutdownTest(unittest.TestCase):
         self.assertIsNone(snapshotter._thread)
         snapshotter.wrist.stop.assert_called_once_with()
         snapshotter.front.stop.assert_called_once_with()
+
+
+class DualRealSenseDuplicateFrameTest(unittest.TestCase):
+    def test_repeated_wrist_frame_is_not_added_to_history(self):
+        def frame(number):
+            return {
+                "bgr": np.zeros((2, 2, 3), dtype=np.uint8),
+                "depth_m": np.ones((2, 2), dtype=np.float32),
+                "frame_number": number,
+                "sensor_timestamp_ms": float(number),
+                "timestamp_domain": "timestamp_domain.global_time",
+                "wall_time_ns": number * 1_000_000,
+            }
+
+        snapshotter = DualRealSenseSnapshotter.__new__(DualRealSenseSnapshotter)
+        snapshotter._stop_event = threading.Event()
+        snapshotter._lock = threading.Lock()
+        snapshotter._thread_error = None
+        snapshotter._latest = None
+        snapshotter._history = deque(maxlen=8)
+        snapshotter._next_sequence = 0
+        snapshotter._duplicate_frame_counts = {"front": 0, "wrist": 0}
+        snapshotter.tracker = None
+        snapshotter.record_size = (2, 2)
+        snapshotter.front_record_geometry = center_crop_resize_geometry(2, 2, 2, 2)
+        snapshotter.wrist_record_geometry = center_crop_resize_geometry(2, 2, 2, 2)
+        snapshotter.front = MagicMock()
+        snapshotter.wrist = MagicMock()
+        snapshotter.front.read.side_effect = [frame(1), frame(2), frame(3)]
+        wrist_frames = iter([frame(1), frame(1), frame(2)])
+
+        def read_wrist():
+            result = next(wrist_frames)
+            if result["frame_number"] == 2:
+                snapshotter._stop_event.set()
+            return result
+
+        snapshotter.wrist.read.side_effect = read_wrist
+        snapshotter._capture_loop()
+
+        samples, cursor = snapshotter.samples_since(0)
+        self.assertEqual(cursor, 2)
+        self.assertEqual([sample["capture_sequence"] for sample in samples], [0, 1])
+        self.assertEqual([sample["wrist_frame_number"] for sample in samples], [1, 2])
+        self.assertEqual(snapshotter.duplicate_frame_counts(), {"front": 0, "wrist": 1})
+
+
+class DualRealSenseTrackerThreadTest(unittest.TestCase):
+    def test_slow_tracker_uses_latest_frame_without_blocking_submitter(self):
+        entered = threading.Event()
+        release = threading.Event()
+        processed = []
+
+        class SlowTracker:
+            def update(self, color_bgr, _intrinsics):
+                value = int(color_bgr[0, 0, 0])
+                processed.append(value)
+                if value == 1:
+                    entered.set()
+                    release.wait(timeout=1.0)
+                return {"tracker_value": value}
+
+        snapshotter = DualRealSenseSnapshotter.__new__(DualRealSenseSnapshotter)
+        snapshotter._stop_event = threading.Event()
+        snapshotter._tracker_condition = threading.Condition()
+        snapshotter._tracker_input = None
+        snapshotter._latest_tracking = None
+        snapshotter._tracker_error = None
+        snapshotter.tracker = SlowTracker()
+        snapshotter.front = SimpleNamespace(intrinsics=object())
+        thread = threading.Thread(target=snapshotter._tracker_loop)
+        thread.start()
+        try:
+            with snapshotter._tracker_condition:
+                snapshotter._tracker_input = np.full((1, 1, 3), 1, dtype=np.uint8)
+                snapshotter._tracker_condition.notify()
+            self.assertTrue(entered.wait(timeout=1.0))
+            with snapshotter._tracker_condition:
+                snapshotter._tracker_input = np.full((1, 1, 3), 2, dtype=np.uint8)
+                snapshotter._tracker_input = np.full((1, 1, 3), 3, dtype=np.uint8)
+                snapshotter._tracker_condition.notify()
+            release.set()
+            for _ in range(100):
+                with snapshotter._tracker_condition:
+                    if snapshotter._latest_tracking == {"tracker_value": 3}:
+                        break
+                threading.Event().wait(0.005)
+            self.assertEqual(processed, [1, 3])
+            self.assertEqual(snapshotter._latest_tracking, {"tracker_value": 3})
+        finally:
+            snapshotter._stop_event.set()
+            with snapshotter._tracker_condition:
+                snapshotter._tracker_condition.notify_all()
+            thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(snapshotter._tracker_error)
 
 
 class FurniturePoseTrackerTest(unittest.TestCase):

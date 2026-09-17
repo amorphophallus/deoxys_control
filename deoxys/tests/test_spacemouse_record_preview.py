@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,9 @@ import numpy as np
 
 from deoxys.utils.io_devices import spacemouse as spacemouse_module
 from examples.run_deoxys_with_space_mouse_V3_record import (
+    AsyncActionDispatcher,
+    AsyncCameraBufferCollector,
+    AsyncObservationPreview,
     RawEpisodeRecorder,
     SPACEMOUSE_PRODUCT_IDS,
     TASK_PART_NAMES,
@@ -19,7 +23,9 @@ from examples.run_deoxys_with_space_mouse_V3_record import (
     _raw_episode_counts,
     build_observation,
     delta_action_to_absolute,
+    delta_wrist_command_to_absolute_target,
     parse_args,
+    integrate_absolute_wrist_target,
 )
 
 
@@ -42,7 +48,327 @@ def camera_sample(part_z=1.0, pose_count=6):
     }
 
 
+class AsyncObservationPreviewTest(unittest.TestCase):
+    def test_unsupported_live_fsm_reports_error_without_crashing(self):
+        observation = camera_sample(pose_count=3)
+        observation["camera_capture_wall_time_ns"] = 123
+        camera = MagicMock()
+        camera.latest.return_value = observation
+
+        def unsupported(*_args):
+            raise ValueError("round_table real annotator unavailable")
+
+        with (
+            patch.dict(
+                AsyncObservationPreview._run_once.__globals__,
+                {"build_observation": lambda *_args: observation},
+            ),
+            patch("examples.run_deoxys_with_space_mouse_V3_record.cv2.imshow"),
+            patch(
+                "examples.run_deoxys_with_space_mouse_V3_record.cv2.waitKey",
+                return_value=-1,
+            ),
+        ):
+            result = AsyncObservationPreview._run_once(
+                camera,
+                MagicMock(),
+                {"front": {"record_intrinsics": RECORD_INTRINSICS}},
+                "robot-base",
+                "round_table",
+                False,
+                "recording",
+                unsupported,
+                True,
+                None,
+                None,
+                None,
+                None,
+                0,
+                True,
+                0.05,
+                3.0,
+                "viridis",
+            )
+
+        self.assertIn("round_table real annotator unavailable", result["annotation_error"])
+        self.assertIsNone(result["last_annotation_observation"])
+
+    def test_live_fsm_result_reaches_dashboard(self):
+        observation = camera_sample()
+        observation["camera_capture_wall_time_ns"] = 123
+        session = MagicMock()
+
+        def annotate(target):
+            target.update(
+                skill="pick",
+                skill_state="reach",
+                guidance_point_2d={
+                    "color_image1": None,
+                    "color_image2": np.array([160.0, 120.0]),
+                },
+            )
+
+        session.annotate_observation.side_effect = annotate
+        camera = MagicMock()
+        camera.latest.return_value = camera_sample()
+        with (
+            patch.dict(
+                AsyncObservationPreview._run_once.__globals__,
+                {"build_observation": lambda *_args: observation},
+            ),
+            patch("examples.run_deoxys_with_space_mouse_V3_record.cv2.imshow"),
+            patch(
+                "examples.run_deoxys_with_space_mouse_V3_record.cv2.waitKey",
+                return_value=-1,
+            ),
+        ):
+            result = AsyncObservationPreview._run_once(
+                camera,
+                MagicMock(),
+                {"front": {"record_intrinsics": RECORD_INTRINSICS}},
+                "robot-base",
+                "one_leg",
+                False,
+                "recording",
+                lambda *_args: session,
+                True,
+                None,
+                None,
+                None,
+                None,
+                0,
+                True,
+                0.05,
+                3.0,
+                "viridis",
+            )
+
+        self.assertEqual(result["last_annotation_observation"]["skill"], "pick")
+        self.assertEqual(result["annotation_capture_ns"], 123)
+        self.assertIsNone(result["annotation_error"])
+        session.annotate_observation.assert_called_once_with(observation)
+
+    def test_slow_observation_does_not_block_control_thread(self):
+        camera = MagicMock()
+        camera.latest.return_value = camera_sample()
+        expected = {"camera_capture_wall_time_ns": 123}
+
+        def slow_build(*_args, **_kwargs):
+            time.sleep(0.05)
+            return expected
+
+        worker = AsyncObservationPreview(
+            camera=camera,
+            robot_interface=MagicMock(),
+            camera_info={"front": {"record_intrinsics": RECORD_INTRINSICS}},
+            eepose_frame="robot-base",
+            task_name="one_leg",
+            draw_part_poses=False,
+            annotation_session_factory=None,
+            enable_annotation=False,
+            show_window=False,
+            depth_min_m=0.05,
+            depth_max_m=3.0,
+            depth_colormap="viridis",
+        )
+        try:
+            with patch.dict(
+                AsyncObservationPreview._run_once.__globals__,
+                {"build_observation": slow_build},
+            ):
+                started = time.perf_counter()
+                worker.pump("recording")
+                self.assertLess(time.perf_counter() - started, 0.02)
+                deadline = time.monotonic() + 1.0
+                while worker.latest_observation is None and time.monotonic() < deadline:
+                    worker.pump("recording")
+                    time.sleep(0.005)
+                self.assertIs(worker.latest_observation, expected)
+        finally:
+            worker.close()
+
+
+class AsyncActionDispatcherTest(unittest.TestCase):
+    def test_30hz_integration_preserves_10hz_motion_speed(self):
+        cfg = MagicMock(
+            action_scale=MagicMock(translation=0.05, rotation=1.0)
+        )
+        pose = np.eye(4)
+        raw_action = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.3, -1.0])
+        for _ in range(3):
+            pose, _ = integrate_absolute_wrist_target(
+                pose, raw_action, cfg, 10.0 / 30.0
+            )
+        self.assertAlmostEqual(pose[0, 3], 0.05)
+        expected = np.array(
+            [
+                [np.cos(0.3), -np.sin(0.3), 0.0],
+                [np.sin(0.3), np.cos(0.3), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        np.testing.assert_allclose(pose[:3, :3], expected, atol=1e-7)
+
+    def test_slow_arm_send_does_not_delay_gripper_lane(self):
+        class FakeRobot:
+            def __init__(self):
+                self.arm_finished = None
+                self.gripper_sent = None
+                self.last_gripper_command_wall_time_ns = None
+
+            def control(self, **_kwargs):
+                time.sleep(0.06)
+                self.arm_finished = time.perf_counter()
+                return {"robot_command_wall_time_ns": time.time_ns()}
+
+            def gripper_control(self, _action):
+                self.gripper_sent = time.perf_counter()
+                self.last_gripper_command_wall_time_ns = time.time_ns()
+
+        class FakeEpisode:
+            def __init__(self):
+                self.records = []
+
+            def record_raw_dispatch(self, record):
+                self.records.append(record)
+
+        robot = FakeRobot()
+        episode = FakeEpisode()
+        dispatcher = AsyncActionDispatcher(
+            robot_interface=robot,
+            controller_type="OSC_POSE",
+            controller_cfg=MagicMock(
+                action_scale=MagicMock(translation=1.0, rotation=1.0)
+            ),
+            arm_latency_ns=120_000_000,
+            gripper_latency_ns=642_000_000,
+        )
+        sample_wall_time_ns = time.time_ns()
+        started = time.perf_counter()
+        dispatcher.submit_arm(
+            np.zeros(7, dtype=np.float64),
+            sample_wall_time_ns=sample_wall_time_ns,
+            sample_index=0,
+        )
+        dispatcher.submit_gripper(
+            -1.0,
+            sample_wall_time_ns=sample_wall_time_ns,
+            sample_index=0,
+        )
+        self.assertLess(time.perf_counter() - started, 0.02)
+        dispatcher.close(episode)
+
+        self.assertLess(robot.gripper_sent, robot.arm_finished)
+        executed = [row for row in episode.records if row["status"] == "executed"]
+        self.assertEqual({row["channel"] for row in executed}, {"robot", "gripper"})
+        for row in executed:
+            expected_latency = 120_000_000 if row["channel"] == "robot" else 642_000_000
+            self.assertEqual(
+                row["predicted_effect_wall_time_ns"],
+                row["command_wall_time_ns"] + expected_latency,
+            )
+
+    def test_slow_arm_lane_keeps_only_latest_waiting_target(self):
+        class FakeRobot:
+            last_gripper_command_wall_time_ns = 0
+
+            def control(self, **_kwargs):
+                time.sleep(0.05)
+                return {"robot_command_wall_time_ns": time.time_ns()}
+
+            def gripper_control(self, _action):
+                self.last_gripper_command_wall_time_ns = time.time_ns()
+
+        class FakeEpisode:
+            def __init__(self):
+                self.records = []
+
+            def record_raw_dispatch(self, record):
+                self.records.append(record)
+
+        dispatcher = AsyncActionDispatcher(
+            robot_interface=FakeRobot(),
+            controller_type="OSC_POSE",
+            controller_cfg=MagicMock(),
+            arm_latency_ns=120_000_000,
+            gripper_latency_ns=642_000_000,
+        )
+        episode = FakeEpisode()
+        for index in range(4):
+            action = np.zeros(7)
+            action[0] = index
+            dispatcher.submit_arm(
+                action,
+                sample_wall_time_ns=time.time_ns(),
+                sample_index=index,
+            )
+        dispatcher.close(episode)
+        executed = [
+            row for row in episode.records
+            if row["channel"] == "robot" and row["status"] == "executed"
+        ]
+        overwritten = [
+            row for row in episode.records
+            if row["status"] == "overwritten_before_send"
+        ]
+        self.assertEqual([row["sample_index"] for row in executed], [0, 3])
+        self.assertEqual(len(overwritten), 2)
+
+
+class AsyncCameraBufferCollectorTest(unittest.TestCase):
+    def test_camera_copy_runs_off_the_control_thread(self):
+        class FakeCamera:
+            def __init__(self):
+                self.calls = 0
+
+            def samples_since(self, cursor):
+                self.calls += 1
+                time.sleep(0.03)
+                return ([{"capture_sequence": self.calls}], self.calls)
+
+        class FakeEpisode:
+            def __init__(self):
+                self.samples = []
+                self.errors = []
+
+            def add_camera_samples(self, samples):
+                self.samples.extend(samples)
+
+            def mark_buffer_error(self, error):
+                self.errors.append(error)
+
+        camera = FakeCamera()
+        episode = FakeEpisode()
+        collector = AsyncCameraBufferCollector(
+            camera=camera,
+            episode=episode,
+            history_cursor=0,
+            poll_s=0.001,
+        )
+        started = time.perf_counter()
+        collector.start()
+        self.assertLess(time.perf_counter() - started, 0.02)
+        time.sleep(0.04)
+        collector.stop()
+
+        self.assertGreaterEqual(len(episode.samples), 1)
+        self.assertEqual(episode.errors, [])
+
+
 class TimestampedActionTest(unittest.TestCase):
+    def test_legacy_delta_audit_target_uses_world_left_rotation(self):
+        wrist_pose = np.eye(4)
+        wrist_pose[:3, 3] = [0.4, 0.1, 0.2]
+        scaled_action = np.array(
+            [0.01, -0.02, 0.03, 0.1, -0.2, 0.3, -1.0]
+        )
+        target = delta_wrist_command_to_absolute_target(
+            scaled_action, wrist_pose
+        )
+        np.testing.assert_allclose(target[:3], [0.41, 0.08, 0.23])
+        np.testing.assert_allclose(target[3:6], scaled_action[3:6], atol=1e-7)
+        self.assertEqual(target[-1], -1.0)
+
     def test_delta_action_absolute_target_uses_local_right_rotation(self):
         pose = np.eye(4)
         pose[:3, 3] = [0.4, 0.1, 0.2]
@@ -93,6 +419,15 @@ class SpaceMouseConnectionTest(unittest.TestCase):
         self.assertEqual(args.spacemouse_connection, "wired")
         self.assertEqual(args.product_id, SPACEMOUSE_PRODUCT_IDS["wired"])
 
+    def test_measured_latency_profile_is_the_default(self):
+        args = self.parse()
+
+        self.assertEqual(args.robot_action_latency_ms, 120.0)
+        self.assertEqual(args.gripper_action_latency_ms, 642.0)
+        self.assertAlmostEqual(args.robot_observation_latency_ms, 0.067)
+        self.assertAlmostEqual(args.gripper_observation_latency_ms, 0.067)
+        self.assertEqual(args.latency_profile_data["latency_source"], "measured")
+
     def test_wireless_connection_selects_wireless_product_id(self):
         args = self.parse("--spacemouse-connection", "wireless")
 
@@ -118,16 +453,17 @@ class SpaceMouseConnectionTest(unittest.TestCase):
 
         self.assertEqual(args.task_name, "lamp")
 
-    def test_real_skill_annotation_is_explicit_and_one_leg_only(self):
+    def test_unsupported_real_skill_annotation_can_save_incomplete_data(self):
         args = self.parse("--real-skill-annotation")
 
         self.assertTrue(args.real_skill_annotation)
-        with self.assertRaises(SystemExit):
-            self.parse(
-                "--task-name",
-                "round_table",
-                "--real-skill-annotation",
-            )
+        round_table = self.parse(
+            "--task-name",
+            "round_table",
+            "--real-skill-annotation",
+        )
+        self.assertTrue(round_table.real_skill_annotation)
+        self.assertEqual(round_table.task_name, "round_table")
 
     def test_close_stops_listener_and_closes_hid_device(self):
         hid_device = MagicMock()
@@ -548,6 +884,52 @@ class PartPosePreviewTest(unittest.TestCase):
 
         np.testing.assert_array_equal(front, np.zeros_like(front))
         self.assertTrue(np.any(rendered[108:133, 148:173] != 0))
+
+    def test_dashboard_marks_both_camera_targets_and_fsm_status(self):
+        sample = camera_sample()
+        observation = camera_sample()
+        observation.update(
+            skill="pick",
+            skill_state="reach",
+            guidance_point_2d={
+                "color_image1": np.array([100.0, 150.0]),
+                "color_image2": np.array([160.0, 120.0]),
+            },
+        )
+        preview = _build_camera_preview(
+            sample,
+            {"front": {"record_intrinsics": RECORD_INTRINSICS}},
+            episode_state="recording",
+            draw_part_poses=False,
+            annotation_observation=observation,
+        )
+        self.assertTrue(np.any(preview[285:315, 185:215] != 0))
+        self.assertTrue(np.any(preview[225:255, 945:975] != 0))
+        np.testing.assert_array_equal(sample["color_image1"], 0)
+        np.testing.assert_array_equal(sample["color_image2"], 0)
+
+        off = _build_camera_preview(
+            sample,
+            {"front": {"record_intrinsics": RECORD_INTRINSICS}},
+            episode_state="idle",
+            draw_part_poses=False,
+            annotation_status="OFF: ADD --real-skill-annotation",
+        )
+        self.assertTrue(np.any(off[70:95, 10:630] != 0))
+
+    def test_fsm_text_is_white_below_state_without_background(self):
+        wrist = np.full((240, 320, 3), 80, dtype=np.uint8)
+        rendered = _draw_real_skill_annotation(
+            wrist,
+            None,
+            image_key="color_image1",
+            status="OFF",
+            show_text=True,
+        )
+
+        np.testing.assert_array_equal(wrist, 80)
+        self.assertEqual(rendered[47, 150].tolist(), [80, 80, 80])
+        self.assertGreater(int(rendered[30:46].max()), 200)
 
     def test_skips_part_pose_behind_camera(self):
         sample = camera_sample(part_z=-1.0)
