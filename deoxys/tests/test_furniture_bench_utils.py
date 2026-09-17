@@ -81,6 +81,73 @@ class DualRealSenseDuplicateFrameTest(unittest.TestCase):
         self.assertEqual([sample["wrist_frame_number"] for sample in samples], [1, 2])
         self.assertEqual(snapshotter.duplicate_frame_counts(), {"front": 0, "wrist": 1})
 
+    def test_wrist_frame_is_matched_to_nearest_front_sensor_time(self):
+        def frame(number, timestamp_ms):
+            return {
+                "bgr": np.zeros((2, 2, 3), dtype=np.uint8),
+                "depth_m": np.ones((2, 2), dtype=np.float32),
+                "frame_number": number,
+                "sensor_timestamp_ms": float(timestamp_ms),
+                "timestamp_domain": "timestamp_domain.global_time",
+                "wall_time_ns": number * 1_000_000,
+            }
+
+        snapshotter = DualRealSenseSnapshotter.__new__(DualRealSenseSnapshotter)
+        snapshotter._stop_event = threading.Event()
+        snapshotter._lock = threading.Lock()
+        snapshotter._thread_error = None
+        snapshotter._latest = None
+        snapshotter._history = deque(maxlen=8)
+        snapshotter._next_sequence = 0
+        snapshotter._duplicate_frame_counts = {"front": 0, "wrist": 0}
+        snapshotter.tracker = None
+        snapshotter.record_size = (2, 2)
+        snapshotter.front_record_geometry = center_crop_resize_geometry(2, 2, 2, 2)
+        snapshotter.wrist_record_geometry = center_crop_resize_geometry(2, 2, 2, 2)
+        snapshotter.front = MagicMock()
+        snapshotter.wrist = MagicMock()
+        snapshotter.front.read.side_effect = [
+            frame(1, 100.0),
+            frame(2, 133.0),
+        ]
+        wrist_frames = iter(
+            [
+                frame(1, 90.0),
+                frame(2, 123.0),
+                frame(3, 188.0),
+            ]
+        )
+
+        def read_wrist():
+            result = next(wrist_frames)
+            if result["frame_number"] == 3:
+                snapshotter._stop_event.set()
+            return result
+
+        snapshotter.wrist.read.side_effect = read_wrist
+        snapshotter._capture_loop()
+
+        samples, cursor = snapshotter.samples_since(0)
+        self.assertEqual(cursor, 2)
+        self.assertEqual(
+            [sample["front_sensor_timestamp_ms"] for sample in samples],
+            [100.0, 133.0],
+        )
+        self.assertEqual(
+            [sample["wrist_sensor_timestamp_ms"] for sample in samples],
+            [90.0, 123.0],
+        )
+        self.assertLess(
+            max(
+                abs(
+                    sample["wrist_sensor_timestamp_ms"]
+                    - sample["front_sensor_timestamp_ms"]
+                )
+                for sample in samples
+            ),
+            50.0,
+        )
+
 
 class DualRealSenseTrackerThreadTest(unittest.TestCase):
     def test_slow_tracker_uses_latest_frame_without_blocking_submitter(self):

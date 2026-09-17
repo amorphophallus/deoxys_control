@@ -602,19 +602,63 @@ class DualRealSenseSnapshotter:
         try:
             last_front_frame = None
             last_wrist_frame = None
+            wrist_candidates = deque(maxlen=2)
             while not self._stop_event.is_set():
                 front = self.front.read()
-                wrist = self.wrist.read()
-                if front is None or wrist is None:
+                if front is None:
                     continue
                 front_frame = (front["frame_number"], front["sensor_timestamp_ms"])
-                wrist_frame = (wrist["frame_number"], wrist["sensor_timestamp_ms"])
                 duplicate_front = front_frame == last_front_frame
-                duplicate_wrist = wrist_frame == last_wrist_frame
-                if duplicate_front or duplicate_wrist:
+                if duplicate_front:
                     with self._lock:
-                        self._duplicate_frame_counts["front"] += int(duplicate_front)
-                        self._duplicate_frame_counts["wrist"] += int(duplicate_wrist)
+                        self._duplicate_frame_counts["front"] += 1
+                    continue
+
+                front_time_ms = float(front["sensor_timestamp_ms"])
+                wrist_read_failed = False
+                while (
+                    not self._stop_event.is_set()
+                    and (
+                        not wrist_candidates
+                        or float(wrist_candidates[-1]["sensor_timestamp_ms"])
+                        < front_time_ms
+                    )
+                ):
+                    wrist = self.wrist.read()
+                    if wrist is None:
+                        wrist_read_failed = True
+                        break
+                    wrist_frame = (
+                        wrist["frame_number"],
+                        wrist["sensor_timestamp_ms"],
+                    )
+                    if wrist_candidates:
+                        newest = wrist_candidates[-1]
+                        newest_frame = (
+                            newest["frame_number"],
+                            newest["sensor_timestamp_ms"],
+                        )
+                        if wrist_frame == newest_frame:
+                            with self._lock:
+                                self._duplicate_frame_counts["wrist"] += 1
+                            continue
+                    wrist_candidates.append(wrist)
+                if wrist_read_failed or not wrist_candidates:
+                    continue
+
+                wrist = min(
+                    wrist_candidates,
+                    key=lambda candidate: abs(
+                        float(candidate["sensor_timestamp_ms"]) - front_time_ms
+                    ),
+                )
+                wrist_frame = (
+                    wrist["frame_number"],
+                    wrist["sensor_timestamp_ms"],
+                )
+                if wrist_frame == last_wrist_frame:
+                    with self._lock:
+                        self._duplicate_frame_counts["wrist"] += 1
                     continue
                 sample = {
                     "color_image1": cv2.cvtColor(
