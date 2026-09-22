@@ -74,6 +74,7 @@ RESET_JOINT_POSITIONS = [
 ]
 
 PREVIEW_WINDOW_NAME = "FurnitureBench SpaceMouse data collection"
+CAMERA_STALL_WARNING_S = 1.0
 TASK_PART_NAMES = {
     "one_leg": {0: "tabletop", 4: "movable_leg"},
     "round_table": {
@@ -1685,6 +1686,7 @@ def _build_camera_preview(
     depth_min_m=0.05,
     depth_max_m=3.0,
     depth_colormap="viridis",
+    camera_health=None,
 ):
     if camera_sample is None:
         return None
@@ -1824,19 +1826,63 @@ def _build_camera_preview(
                 1,
                 cv2.LINE_AA,
             )
-        return cv2.vconcat(
+        preview = cv2.vconcat(
             [
                 cv2.hconcat([wrist, wrist_raw, wrist_enhanced]),
                 cv2.hconcat([front, front_raw, front_enhanced]),
             ]
         )
+        return _draw_camera_health_warning(preview, camera_health)
 
     combined = cv2.hconcat([wrist, front])
-    return cv2.resize(
+    preview = cv2.resize(
         combined,
         (combined.shape[1] * 2, combined.shape[0] * 2),
         interpolation=cv2.INTER_LINEAR,
     )
+    return _draw_camera_health_warning(preview, camera_health)
+
+
+def _draw_camera_health_warning(preview, camera_health):
+    if not isinstance(camera_health, dict) or not camera_health.get("stale"):
+        return preview
+    age_ms = camera_health.get("last_pair_age_ms")
+    age_text = "unknown"
+    if age_ms is not None:
+        age_text = f"{float(age_ms) / 1000.0:.1f}s"
+    waiting_for = camera_health.get("waiting_for") or "paired stream"
+    banner_height = min(88, preview.shape[0])
+    overlay = preview.copy()
+    cv2.rectangle(overlay, (0, 0), (preview.shape[1], banner_height), (0, 0, 255), -1)
+    cv2.addWeighted(overlay, 0.78, preview, 0.22, 0.0, preview)
+    cv2.rectangle(
+        preview,
+        (2, 2),
+        (preview.shape[1] - 3, preview.shape[0] - 3),
+        (0, 0, 255),
+        8,
+    )
+    cv2.putText(
+        preview,
+        f"CAMERA STALLED: no new RGB-D pair for {age_text} (waiting: {waiting_for})",
+        (12, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        preview,
+        "STOP THIS ROLLOUT (e) AND CHECK REALSENSE / USB",
+        (12, 68),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.68,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return preview
 
 
 def _write_video_atomic(output_path, observations, fps):
@@ -1999,7 +2045,14 @@ class AsyncObservationPreview:
         depth_max_m,
         depth_colormap,
     ):
-        camera_sample = camera.latest()
+        health_snapshot = getattr(camera, "health_snapshot", None)
+        camera_health = health_snapshot() if callable(health_snapshot) else {}
+        if not isinstance(camera_health, dict):
+            camera_health = {}
+        if camera_health.get("thread_error") and hasattr(camera, "latest_for_preview"):
+            camera_sample = camera.latest_for_preview()
+        else:
+            camera_sample = camera.latest()
         observation = build_observation(
             robot_interface,
             camera_sample,
@@ -2044,6 +2097,7 @@ class AsyncObservationPreview:
                 depth_min_m=depth_min_m,
                 depth_max_m=depth_max_m,
                 depth_colormap=depth_colormap,
+                camera_health=camera_health,
             )
             if preview is not None:
                 cv2.imshow(PREVIEW_WINDOW_NAME, preview)
@@ -3374,6 +3428,17 @@ class RawEpisodeRecorder:
                     phase="offline_alignment",
                 )
 
+        trimmed_trailing_ms = float(
+            self.buffer_alignment_report.get("trimmed_trailing_ms", 0.0)
+        )
+        if trimmed_trailing_ms > float(camera_hard_gap_ms):
+            self.mark_buffer_error(
+                "camera coverage ended "
+                f"{trimmed_trailing_ms:.3f} ms before the requested episode end; "
+                "the missing tail was not materialized",
+                phase="camera_coverage",
+            )
+
         invalid_pose_frames = [
             index
             for index, observation in enumerate(self.observations)
@@ -4338,6 +4403,9 @@ def main():
         worst_loop_phase_ms = {}
         direct_action_sample_index = 0
         control_fault = False
+        camera_stall_active = False
+        camera_stall_issue_recorded = False
+        last_camera_warning_monotonic = 0.0
 
         def stop_camera_collector():
             nonlocal camera_collector
@@ -4419,6 +4487,33 @@ def main():
             while running:
                 loop_start_monotonic = time.monotonic()
                 after_dispatch = time.monotonic()
+                camera_health = camera.health_snapshot(CAMERA_STALL_WARNING_S)
+                camera_stale = bool(camera_health.get("stale"))
+                if camera_stale:
+                    age_ms = camera_health.get("last_pair_age_ms")
+                    waiting_for = camera_health.get("waiting_for") or "paired stream"
+                    if (
+                        loop_start_monotonic - last_camera_warning_monotonic
+                        >= 1.0
+                    ):
+                        logger.error(
+                            "CAMERA STALLED: no new RGB-D pair for %.1f s "
+                            "(waiting=%s). Stop this rollout and check RealSense/USB.",
+                            float(age_ms or 0.0) / 1000.0,
+                            waiting_for,
+                        )
+                        last_camera_warning_monotonic = loop_start_monotonic
+                    if episode.state == "recording" and not camera_stall_issue_recorded:
+                        episode.mark_buffer_error(
+                            "live camera watchdog detected no new RGB-D pair for "
+                            f"{float(age_ms or 0.0):.1f} ms (waiting={waiting_for})",
+                            phase="camera_watchdog",
+                        )
+                        camera_stall_issue_recorded = True
+                    camera_stall_active = True
+                elif camera_stall_active:
+                    logger.info("Camera stream recovered; new RGB-D pairs are arriving")
+                    camera_stall_active = False
                 preview_state = episode.state
                 if recording_start_due_monotonic is not None:
                     remaining_s = recording_start_due_monotonic - time.monotonic()
@@ -4518,8 +4613,10 @@ def main():
                     recording_start_due_monotonic is not None
                     and time.monotonic() >= recording_start_due_monotonic
                     and observation is not None
+                    and not camera_stale
                 ):
                     recording_start_due_monotonic = None
+                    camera_stall_issue_recorded = False
                     camera_history_cursor = camera.history_cursor()
                     initial_wrist_pose = np.asarray(
                         observation["robot_state"]["wrist_pose"], dtype=np.float64

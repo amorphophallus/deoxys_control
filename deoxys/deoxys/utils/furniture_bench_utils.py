@@ -546,6 +546,11 @@ class DualRealSenseSnapshotter:
         self._history = deque(maxlen=max(2, int(history_size)))
         self._next_sequence = 0
         self._duplicate_frame_counts = {"front": 0, "wrist": 0}
+        self._capture_started_wall_time_ns = None
+        self._last_front_wall_time_ns = None
+        self._last_wrist_wall_time_ns = None
+        self._last_pair_wall_time_ns = None
+        self._pair_waiting_for = None
 
     def start(self):
         devices = connected_realsense_devices()
@@ -564,6 +569,8 @@ class DualRealSenseSnapshotter:
         except Exception:
             self.front.stop()
             raise
+        with self._lock:
+            self._capture_started_wall_time_ns = time.time_ns()
         if self.tracker is not None:
             self._tracker_thread = threading.Thread(
                 target=self._tracker_loop,
@@ -614,8 +621,13 @@ class DualRealSenseSnapshotter:
                         self._duplicate_frame_counts["front"] += 1
                     continue
 
+                with self._lock:
+                    self._last_front_wall_time_ns = int(front["wall_time_ns"])
+
                 front_time_ms = float(front["sensor_timestamp_ms"])
                 wrist_read_failed = False
+                with self._lock:
+                    self._pair_waiting_for = "wrist"
                 while (
                     not self._stop_event.is_set()
                     and (
@@ -643,6 +655,8 @@ class DualRealSenseSnapshotter:
                                 self._duplicate_frame_counts["wrist"] += 1
                             continue
                     wrist_candidates.append(wrist)
+                    with self._lock:
+                        self._last_wrist_wall_time_ns = int(wrist["wall_time_ns"])
                 if wrist_read_failed or not wrist_candidates:
                     continue
 
@@ -718,6 +732,10 @@ class DualRealSenseSnapshotter:
                     self._latest = sample
                     self._history.append(sample)
                     self._next_sequence += 1
+                    self._last_pair_wall_time_ns = int(
+                        sample["camera_capture_wall_time_ns"]
+                    )
+                    self._pair_waiting_for = None
                 last_front_frame = front_frame
                 last_wrist_frame = wrist_frame
         except Exception as exc:
@@ -729,6 +747,11 @@ class DualRealSenseSnapshotter:
     def latest(self):
         if self._thread_error is not None:
             raise RuntimeError("dual RealSense capture failed") from self._thread_error
+        return self.latest_for_preview()
+
+    def latest_for_preview(self):
+        """Return the last published pair even after capture failure."""
+
         with self._lock:
             if self._latest is None:
                 return None
@@ -749,6 +772,54 @@ class DualRealSenseSnapshotter:
     def duplicate_frame_counts(self):
         with self._lock:
             return dict(self._duplicate_frame_counts)
+
+    def health_snapshot(self, stale_after_s=1.0):
+        """Return non-blocking dual-camera liveness for the live dashboard."""
+
+        now_ns = time.time_ns()
+        with self._lock:
+            started_ns = self._capture_started_wall_time_ns
+            pair_ns = self._last_pair_wall_time_ns
+            front_ns = self._last_front_wall_time_ns
+            wrist_ns = self._last_wrist_wall_time_ns
+            waiting_for = self._pair_waiting_for
+            sequence = int(self._next_sequence)
+            duplicate_counts = dict(self._duplicate_frame_counts)
+        reference_ns = pair_ns if pair_ns is not None else started_ns
+        age_ms = (
+            None
+            if reference_ns is None
+            else max(0.0, (now_ns - int(reference_ns)) / 1e6)
+        )
+
+        def stream_age_ms(timestamp_ns):
+            if timestamp_ns is None:
+                return None
+            return max(0.0, (now_ns - int(timestamp_ns)) / 1e6)
+
+        stale_after_ms = float(stale_after_s) * 1000.0
+        thread_error = (
+            None
+            if self._thread_error is None
+            else f"{type(self._thread_error).__name__}: {self._thread_error}"
+        )
+        return {
+            "ok": (
+                thread_error is None
+                and age_ms is not None
+                and age_ms < stale_after_ms
+            ),
+            "stale": thread_error is not None
+            or (age_ms is not None and age_ms >= stale_after_ms),
+            "last_pair_age_ms": age_ms,
+            "front_age_ms": stream_age_ms(front_ns),
+            "wrist_age_ms": stream_age_ms(wrist_ns),
+            "waiting_for": waiting_for,
+            "capture_sequence": sequence,
+            "duplicate_frame_counts": duplicate_counts,
+            "stale_after_ms": stale_after_ms,
+            "thread_error": thread_error,
+        }
 
     def samples_since(self, sequence):
         """Return every buffered pair at or after ``sequence`` plus a new cursor.

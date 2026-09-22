@@ -1,4 +1,5 @@
 import threading
+import time
 import unittest
 from collections import deque
 from types import SimpleNamespace
@@ -38,6 +39,26 @@ class DualRealSenseShutdownTest(unittest.TestCase):
 
 
 class DualRealSenseDuplicateFrameTest(unittest.TestCase):
+    def test_health_snapshot_flags_stalled_pair_stream(self):
+        snapshotter = DualRealSenseSnapshotter.__new__(DualRealSenseSnapshotter)
+        snapshotter._lock = threading.Lock()
+        snapshotter._thread_error = None
+        snapshotter._capture_started_wall_time_ns = time.time_ns() - 3_000_000_000
+        snapshotter._last_pair_wall_time_ns = time.time_ns() - 2_000_000_000
+        snapshotter._last_front_wall_time_ns = time.time_ns() - 2_000_000_000
+        snapshotter._last_wrist_wall_time_ns = time.time_ns() - 2_000_000_000
+        snapshotter._pair_waiting_for = "wrist"
+        snapshotter._next_sequence = 42
+        snapshotter._duplicate_frame_counts = {"front": 0, "wrist": 11}
+
+        health = snapshotter.health_snapshot(stale_after_s=1.0)
+
+        self.assertTrue(health["stale"])
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["waiting_for"], "wrist")
+        self.assertEqual(health["capture_sequence"], 42)
+        self.assertGreaterEqual(health["last_pair_age_ms"], 1900.0)
+
     def test_repeated_wrist_frame_is_not_added_to_history(self):
         def frame(number):
             return {

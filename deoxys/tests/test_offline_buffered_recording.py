@@ -99,6 +99,54 @@ def gripper_command(effect_time_ns, action=-1.0, sample_index=0):
 
 
 class OfflineBufferedAlignmentTest(unittest.TestCase):
+    def test_missing_camera_tail_is_reported_as_incomplete(self):
+        writer = SimpleNamespace(submit=Mock())
+        start = BASE_TIME_NS + PERIOD_NS
+        end = start + 1_000_000_000
+        recorder = RawEpisodeRecorder(
+            data_root="/tmp/camera-tail-test",
+            task_name="one_leg",
+            randomness="low",
+            camera_info={"front": {}, "wrist": {}},
+            writer=writer,
+            output_suffix="unit-test-v6",
+        )
+        self.assertTrue(
+            recorder.begin_buffered(
+                camera_sample(0, start),
+                camera_start_sequence=0,
+                robot_start_index=0,
+                gripper_start_index=0,
+                grid_start_wall_time_ns=start,
+                initial_absolute_wrist_action=np.zeros(7),
+                initial_gripper_action=-1.0,
+            )
+        )
+        recorder.add_camera_samples([camera_sample(1, start)])
+        recorder.grid_end_wall_time_ns = end
+        state_times = [start + index * PERIOD_NS for index in range(11)]
+
+        self.assertFalse(
+            recorder.stop_buffered(
+                [robot_record(timestamp, 0.4) for timestamp in state_times],
+                [gripper_record(timestamp) for timestamp in state_times],
+                prompt_depth_estimator=None,
+                prompt_depth_cameras=(),
+                camera_max_residual_ms=50.0,
+                camera_pair_max_skew_ms=40.0,
+                camera_hard_gap_ms=200.0,
+                robot_max_residual_ms=20.0,
+                gripper_max_residual_ms=60.0,
+            )
+        )
+        self.assertTrue(
+            any(
+                issue["phase"] == "camera_coverage"
+                and "missing tail" in issue["message"]
+                for issue in recorder.quality_issues
+            )
+        )
+
     def test_raw_franka_protobuf_state_can_be_pickled_after_conversion(self):
         from deoxys.proto.franka_interface import franka_robot_state_pb2
 

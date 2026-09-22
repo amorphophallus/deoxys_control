@@ -475,6 +475,11 @@ python -m deoxys.examples.run_deoxys_with_space_mouse_V3_record \
 相机抓帧和 episode 原始帧缓存分别在后台运行，观测拼装、实时 FSM 与 dashboard
 预览在独立的异步 worker 中运行，不进入上述控制调用。按 `b` 后先预热相机 3 秒，
 这期间不采样或发送 SpaceMouse 动作；按 `e` 后再留 1 秒相机/状态 post-roll。
+如果连续 1 秒没有新的 front+wrist RGB-D 配对帧，dashboard 会显示红色
+`CAMERA STALLED` 横幅，控制台也会每秒报警；相机未恢复前不会开始新的 episode。
+录制中出现该警告时应立即按 `e` 停止并检查 RealSense/USB。该次冻结会写入同名
+`.txt` 与 pickle 的 `save_quality`，并将 episode 保存到 `incomplete/`；离线处理还会
+检查相机覆盖是否提前结束，避免把被静默裁短的数据误判为完整数据。
 实时 FSM 在 `one_leg`、`round_table`、`lamp` 加 `--real-skill-annotation` 且打开预览时启用；dashboard
 会显示 `SKILL / skill_state` 和 front/wrist 可见的二维目标点。`FSM: OFF`、
 `WAITING FOR POSES` 或 `ERROR` 表示当前没有可用实时标注，不能误认作无目标点。
@@ -796,7 +801,7 @@ python -m deoxys.examples.process_pickle_prompt_depth \
 `示例_promptda_vitl_comparison.mp4`；新 pickle 的字段、分辨率和单位与数采结束后离线
 增强方案一致。
 
-## RR 240×320 full-frame 真机 Eval（3000 / 5000 epoch）
+## RR 240×320 full-frame 真机 Eval（ModelScope 0912）
 
 以下命令在 FrankaControl 图形桌面终端运行。策略以 front RealSense source time 为
 `T_obs`，action chunk 的目标时间固定为 `T_obs + k * action_period`。推理在后台 worker
@@ -804,10 +809,12 @@ python -m deoxys.examples.process_pickle_prompt_depth \
 queue。通过公共 admission cutoff 且安全检查通过的 action 会原子地进入两条 queue；
 单个通道事件过期只丢弃该事件，不再清空其后的 action。已进入 immutable timeline 的
 timestep 不允许被后续 query 覆盖，后续 query 只能向 timeline 尾部追加。本轮使用
-campaign `rr_real_sim_fullframe_cotrain_0907`：包含 `real40`、
-`real40_sim400` 和 `real10_sim400` 三组，每组各有 3000、5000 epoch，共 6 个固定
-checkpoint。NAS 上没有同批次 `sim400` 的 3000/5000 checkpoint，因此本轮不运行
-`sim400`。所有 checkpoint 都是 240×320 full-frame RGB-D，配置中的
+campaign `rr_real_sim_modelscope_0912`：包含 `real40`、`real40_sim400` 和
+`real10_sim400` 三组，每组都部署了 3000 和 5000 epoch。`real40` 与
+`real40_sim400` 使用最新 `real40-reannotation-v13-timestamp-20260912` 时序数据；
+`real10_sim400` 暂时使用已完成的 `timeline10hz` 版本，不得用尚未训完的
+ws2 `actor_chkpt_last.pt` 冒充 3000/5000。所有 checkpoint 都是 240×320 full-frame
+RGB-D，配置中的
 `data.image_spatial_transform=none`；eval 不再 crop 或 resize。
 
 `evaluate_policy` 会直接读取 checkpoint 配置决定标注方式。本轮 checkpoint 的
@@ -988,23 +995,23 @@ PY
 
 ### 固定 checkpoint 位置
 
-6 个 checkpoint 都在 RR 仓库下，不在 15 TB 盘的旧 campaign 目录：
+6 个固定 epoch checkpoint 都在 RR 仓库下，不在 15 TB 盘的旧 campaign 目录：
 
 ```text
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_3000.pt
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_5000.pt
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_3000.pt
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_5000.pt
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_3000.pt
-/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_fullframe_cotrain_0907/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_5000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real40/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real40/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/actor_chkpt_latest_5000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real40_sim400/rr_modelscope0912_real40_sim400_b256_seed2026091211/rr_modelscope0912_real40_sim400_b256_seed2026091211/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real40_sim400/rr_modelscope0912_real40_sim400_b256_seed2026091211/rr_modelscope0912_real40_sim400_b256_seed2026091211/actor_chkpt_latest_5000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real10_sim400/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz_2026-09-14_16-08-18.727013/actor_chkpt_latest_3000.pt
+/home/hz/code/robust-rearrangement-custom/checkpoints/rr_real_sim_modelscope_0912/real10_sim400/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz_2026-09-14_16-08-18.727013/actor_chkpt_latest_5000.pt
 ```
 
 ### 选择条件和 epoch
 
-每次新开终端都复制下面整个代码块。只需要修改开头的 `RR_RUN` 和 `RR_EPOCH`：
-`RR_RUN` 可取 `real40`、`real40_sim400`、`real10_sim400`，`RR_EPOCH` 可取
-`3000` 或 `5000`。例如 `RR_RUN=real40_sim400`、`RR_EPOCH=5000` 就会选中
-real40+sim400 的 5000 epoch checkpoint。
+每次新开终端都复制下面整个代码块。只需要修改开头的 `RR_RUN` 和
+`RR_EPOCH`：`RR_RUN` 可取 `real40`、`real40_sim400`、`real10_sim400`，
+`RR_EPOCH` 可取 `3000` 或 `5000`。例如 `RR_RUN=real40_sim400`、
+`RR_EPOCH=3000` 就会选中 real40+sim400 的 3000 epoch checkpoint。
 
 ```shell
 source ~/.bashrc
@@ -1013,22 +1020,22 @@ conda activate rr-real
 export RR_ROOT=/home/hz/code/robust-rearrangement-custom
 export DEOXYS_ROOT=/home/hz/code/YueHu_deoxys
 export RR_PYTHON=/home/hz/miniconda3/envs/rr-real/bin/python
-export CKPT_ROOT="$RR_ROOT/checkpoints/rr_real_sim_fullframe_cotrain_0907"
+export CKPT_ROOT="$RR_ROOT/checkpoints/rr_real_sim_modelscope_0912"
 export LATENCY_PROFILE="$RR_ROOT/src/real/latency_profile.measured_20260908.json"
 
 # 只修改这两个变量。
-RR_RUN=real40
-RR_EPOCH=5000
+RR_RUN=real40_sim400
+RR_EPOCH=3000
 
 case "$RR_RUN" in
   real40)
-    RR_RUN_DIR=rr_fullframe0907_real40_b256_seed2026090712
+    RR_RUN_DIR="real40/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916"
     ;;
   real40_sim400)
-    RR_RUN_DIR=rr_fullframe0907_real40_sim400_b256_seed2026090711
+    RR_RUN_DIR="real40_sim400/rr_modelscope0912_real40_sim400_b256_seed2026091211/rr_modelscope0912_real40_sim400_b256_seed2026091211"
     ;;
   real10_sim400)
-    RR_RUN_DIR=rr_fullframe0907_real10_sim400_b256_seed2026090713
+    RR_RUN_DIR="real10_sim400/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz_2026-09-14_16-08-18.727013"
     ;;
   *)
     printf '错误：RR_RUN 必须是 real40、real40_sim400 或 real10_sim400，当前为 %s\n' "$RR_RUN" >&2
@@ -1044,7 +1051,7 @@ case "$RR_EPOCH" in
     ;;
 esac
 
-export RR_CHECKPOINT="$CKPT_ROOT/$RR_RUN/$RR_RUN_DIR/$RR_RUN_DIR/actor_chkpt_latest_${RR_EPOCH}.pt"
+export RR_CHECKPOINT="$CKPT_ROOT/$RR_RUN_DIR/actor_chkpt_latest_${RR_EPOCH}.pt"
 export RR_LOG_DIR="$RR_ROOT/logs/real_policy_eval"
 
 cd "$RR_ROOT"
@@ -1065,7 +1072,7 @@ RR_EVAL_ARGS=(
   --max-wall-time-s 270
   --workspace-min 0.30 -0.35 0.00
   --workspace-max 0.75 0.35 0.60
-  --min-ee-z 0.005
+  --min-ee-z 0.0
   --max-translation-step-m 0.085
   --max-translation-speed-m-s 0.425
   --max-rotation-step-rad 0.40
@@ -1073,7 +1080,6 @@ RR_EVAL_ARGS=(
   --prompt-depth-model vitl
   --prompt-depth-device cuda
   --show-input-dashboard
-  --save-input-video
 )
 ```
 
@@ -1089,7 +1095,7 @@ front RGB、wrist RGB、front PromptDA depth、wrist PromptDA depth 四宫格。
 debug，便于在后续 run 中直接恢复 pick 时的 EE-to-leg 夹持位姿并检查手动物体移动。
 
 若任一 `test` 报错，不要开始真机执行。程序启动后还要检查打印的 checkpoint 路径包含
-`rr_real_sim_fullframe_cotrain_0907`，并确认 checkpoint 配置显示
+`rr_real_sim_modelscope_0912`，并确认 checkpoint 配置显示
 `observation_type=rgbd`、`image_spatial_transform=none`。不要沿用旧终端里的
 `CKPT_ROOT`、`RR_CHECKPOINT` 或 `RR_EVAL_ARGS`。
 
@@ -1097,23 +1103,23 @@ debug，便于在后续 run 中直接恢复 pick 时的 EE-to-leg 夹持位姿�
 
 ```shell
 sha256sum \
-  "$CKPT_ROOT/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_3000.pt" \
-  "$CKPT_ROOT/real40/rr_fullframe0907_real40_b256_seed2026090712/rr_fullframe0907_real40_b256_seed2026090712/actor_chkpt_latest_5000.pt" \
-  "$CKPT_ROOT/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_3000.pt" \
-  "$CKPT_ROOT/real40_sim400/rr_fullframe0907_real40_sim400_b256_seed2026090711/rr_fullframe0907_real40_sim400_b256_seed2026090711/actor_chkpt_latest_5000.pt" \
-  "$CKPT_ROOT/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_3000.pt" \
-  "$CKPT_ROOT/real10_sim400/rr_fullframe0907_real10_sim400_b256_seed2026090713/rr_fullframe0907_real10_sim400_b256_seed2026090713/actor_chkpt_latest_5000.pt"
+  "$CKPT_ROOT/real40/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real40/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/rr_modelscope0912_real40_b256_ws2_seed2026091213_modelscopev13_0916/actor_chkpt_latest_5000.pt" \
+  "$CKPT_ROOT/real40_sim400/rr_modelscope0912_real40_sim400_b256_seed2026091211/rr_modelscope0912_real40_sim400_b256_seed2026091211/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real40_sim400/rr_modelscope0912_real40_sim400_b256_seed2026091211/rr_modelscope0912_real40_sim400_b256_seed2026091211/actor_chkpt_latest_5000.pt" \
+  "$CKPT_ROOT/real10_sim400/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz_2026-09-14_16-08-18.727013/actor_chkpt_latest_3000.pt" \
+  "$CKPT_ROOT/real10_sim400/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz/rr_modelscope0912_real10_sim400_b256_ws1_seed2026091212_timeline10hz_2026-09-14_16-08-18.727013/actor_chkpt_latest_5000.pt"
 ```
 
 期望依次为：
 
 ```text
-c663f2c16a0ae6263620195b55a9b7a6f6ce34147ef8424a62b926c65994b914  real40/3000
-157505aaaa6309ab84dd5413cf8142fc4f25929199babdfe861307382a1a9ef3  real40/5000
-fcb0d6f46cd75550bfebf16a0f441570737211593e1bb3c276da9a8740bee346  real40_sim400/3000
-bf3d45de38cc702c57116c621b9c30e29afa17b47e4d2f2b5d6549202202210d  real40_sim400/5000
-bd900d7ffa240e89f4a1ea44c9953a9fcbcff39768ceeecd1d797bd07b5e046d  real10_sim400/3000
-2d613b8b08f723401ee2ed8f6ec2a4b54de6e00ce72b22f84fba721f2d27dd7d  real10_sim400/5000
+d7917a59916ba6728c08e8fc86441ca8a88ed1968e5fafa7076c4515676babd2  real40/3000
+b7ac91616006421a49aa7d04c6c62c96d2d4c9afe13d02ecfe911bf37ce8f450  real40/5000
+25bf7b6f321027a7f772978c6df49d9aab3b3028319466f6f4050cd5971d6ab8  real40_sim400/3000
+d26a0645ba21ea3cb80f0f0d861484e10d655080001f593c649a0d61a4c8f674  real40_sim400/5000
+dcb3a50c2c17bc9c32169ce96fbbe2f43aec97fc64c57ddda3707c8030fbd028  real10_sim400/3000
+814183afc4365f4dfd119e96ed9809125db5157b115fb9aa418a98f251929923  real10_sim400/5000
 ```
 
 ### 先 dry-run

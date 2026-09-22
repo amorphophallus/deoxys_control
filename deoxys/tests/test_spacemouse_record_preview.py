@@ -514,6 +514,23 @@ class MeasuredEEVelocityTest(unittest.TestCase):
 
 
 class PartPosePreviewTest(unittest.TestCase):
+    def test_stalled_camera_draws_red_dashboard_warning(self):
+        preview = _build_camera_preview(
+            camera_sample(),
+            {"front": {"record_intrinsics": RECORD_INTRINSICS}},
+            "recording",
+            False,
+            camera_health={
+                "stale": True,
+                "last_pair_age_ms": 2300.0,
+                "waiting_for": "wrist",
+            },
+        )
+
+        top = preview[:80]
+        self.assertGreater(float(top[:, :, 2].mean()), float(top[:, :, 0].mean()))
+        self.assertGreater(float(top[:, :, 2].mean()), 100.0)
+
     def test_raw_episode_counts_ignore_derived_and_temporary_pickles(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
